@@ -43,6 +43,16 @@ impl From<u8> for ViaCommand {
     }
 }
 
+/// Key override `options` bits (Vial wire format, QMK `ko_option_t` + enabled flag).
+pub const VIAL_KEY_OVERRIDE_ENABLED: u8 = 1 << 7;
+/// Any (instead of all) of the trigger modifiers activates the override.
+pub const VIAL_KEY_OVERRIDE_ONE_MOD: u8 = 1 << 3;
+/// QMK's default activation bits: trigger down / required mod down / negative mod up.
+pub const VIAL_KEY_OVERRIDE_ALL_ACTIVATIONS: u8 = 0x07;
+/// All `options` bits with a defined meaning on the wire (bit 6 is unused).
+/// These map 1:1 onto `ForkOptions`.
+pub const VIAL_KEY_OVERRIDE_OPTION_BITS: u8 = 0b1011_1111;
+
 /// Information of a via keyboard.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, FromRepr)]
 #[repr(u8)]

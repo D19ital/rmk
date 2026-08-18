@@ -257,6 +257,24 @@ impl KeyMapInner<'_> {
         }
     }
 
+    fn peek_layer_cache(&self, pos: KeyboardEventPos) -> u8 {
+        match pos {
+            KeyboardEventPos::Key(key_pos) => {
+                let ci = self.cache_index(key_pos.row as usize, key_pos.col as usize);
+                self.layer_cache[ci]
+            }
+            KeyboardEventPos::RotaryEncoder(encoder_pos) => {
+                if encoder_pos.direction != Direction::None {
+                    let ci = self.encoder_cache_index(encoder_pos.id as usize, encoder_pos.direction as usize);
+                    if let Some(cache) = self.encoder_layer_cache.get(ci) {
+                        return *cache;
+                    }
+                }
+                self.behavior.default_layer
+            }
+        }
+    }
+
     fn save_layer_cache(&mut self, pos: KeyboardEventPos, layer_num: u8) {
         match pos {
             KeyboardEventPos::Key(key_pos) => {
@@ -416,6 +434,11 @@ impl<'a> KeyMap<'a> {
 
     pub(crate) fn get_action_with_layer_cache(&self, event: KeyboardEvent) -> KeyAction {
         self.inner.borrow_mut().get_action_with_layer_cache(event)
+    }
+
+    /// The layer that sourced the pressed key's action, per the layer cache.
+    pub(crate) fn source_layer_of(&self, pos: KeyboardEventPos) -> u8 {
+        self.inner.borrow().peek_layer_cache(pos)
     }
 
     pub(crate) fn get_action_at(&self, pos: KeyboardEventPos, layer: usize) -> KeyAction {
@@ -631,6 +654,11 @@ impl<'a> KeyMap<'a> {
     pub(crate) fn with_forks<R>(&self, f: impl FnOnce(&[Fork]) -> R) -> R {
         let inner = self.inner.borrow();
         f(&inner.behavior.fork.forks)
+    }
+
+    pub(crate) fn with_forks_mut<R>(&self, f: impl FnOnce(&mut [Fork]) -> R) -> R {
+        let mut inner = self.inner.borrow_mut();
+        f(&mut inner.behavior.fork.forks)
     }
 
     pub(crate) fn with_combos<R>(&self, f: impl FnOnce(&[Option<Combo>]) -> R) -> R {

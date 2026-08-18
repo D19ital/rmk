@@ -23,7 +23,7 @@ use crate::event::{
 };
 use crate::hid::{KeyboardReport, Report};
 use crate::keyboard::combo::Combo;
-use crate::keyboard::fork::ActiveFork;
+use crate::keyboard::fork::{ActiveFork, ForkSwap};
 use crate::keyboard::held_buffer::{HeldBuffer, HeldKey, KeyState};
 use crate::keyboard::mouse::{MouseAction, MouseState};
 use crate::keyboard::oneshot::OneShotState;
@@ -808,6 +808,12 @@ impl<'a> Keyboard<'a> {
         event: KeyboardEvent,
         event_time: Instant,
     ) {
+        // Another key going down deactivates active positive forks unless the
+        // fork opts out (QMK key override semantics)
+        if event.pressed {
+            self.deactivate_forks_on_other_key(original_key_action).await;
+        }
+
         // Start forks
         let key_action = self.try_start_forks(original_key_action, event);
 
@@ -818,6 +824,8 @@ impl<'a> Keyboard<'a> {
 
         #[cfg(feature = "_ble")]
         LAST_KEY_TIMESTAMP.signal(Instant::now().as_secs() as u32);
+
+        let held_modifiers_before = self.held_modifiers;
 
         if !key_action.is_morse() {
             match key_action {
@@ -832,6 +840,13 @@ impl<'a> Keyboard<'a> {
         } else {
             self.process_key_action_morse(&key_action, event, event_time).await;
         }
+
+        // If this event changed the explicit modifiers, held fork triggers may
+        // switch branches mid-hold
+        if self.held_modifiers != held_modifiers_before {
+            self.reevaluate_forks(event).await;
+        }
+
         self.try_finish_forks(original_key_action, event);
     }
 
@@ -868,20 +883,35 @@ impl<'a> Keyboard<'a> {
             mouse: MouseButtons::from_bits(self.mouse.report.buttons),
         };
 
+        // The layer gate is tested against the layer that sourced this key's
+        // action (QMK key override parity), cached by get_action_with_layer_cache
+        let source_layer = self.keymap.source_layer_of(event.pos);
+
         let fork_states = &self.fork_states;
         let with_modifiers = &mut self.with_modifiers;
         let fork_keep_mask = &mut self.fork_keep_mask;
-        let (replacement, chain_starter, combined_suppress) = self.keymap.with_forks(|forks| {
+        let (replacement, chain_starter, combined_suppress, starter_positive) = self.keymap.with_forks(|forks| {
             let mut triggered_forks = [false; FORK_MAX_NUM]; // used to avoid loops
             let mut chain_starter: Option<usize> = None;
             let mut combined_suppress = ModifierCombination::default();
+            let mut starter_positive = false;
             let mut replacement = *key_action;
 
             'bind: loop {
                 for (i, fork) in forks.iter().enumerate() {
-                    if !triggered_forks[i] && fork_states[i].is_none() && fork.trigger == replacement {
-                        let decision = (fork.match_any & decision_state) != StateBits::default()
-                            && (fork.match_none & decision_state) == StateBits::default();
+                    if fork.options.enabled()
+                        && !triggered_forks[i]
+                        && fork_states[i].is_none()
+                        && fork.trigger == replacement
+                    {
+                        // Skip forks that don't apply on the source layer
+                        if let Some(layers) = fork.layers
+                            && (source_layer >= 16 || layers & (1 << source_layer) == 0)
+                        {
+                            continue;
+                        }
+
+                        let decision = fork.options.activate_on_trigger_down() && fork.is_positive(decision_state);
 
                         replacement = if decision {
                             fork.positive_output
@@ -889,7 +919,7 @@ impl<'a> Keyboard<'a> {
                             fork.negative_output
                         };
 
-                        let suppress = fork.match_any.modifiers & !fork.kept_modifiers;
+                        let suppress = fork.suppressed_modifiers;
 
                         combined_suppress |= suppress;
 
@@ -899,15 +929,13 @@ impl<'a> Keyboard<'a> {
                         // effect likely will not cause problem...)
                         *with_modifiers &= !suppress;
 
-                        // Reduce the previously aggregated keeps with the match_any mask
-                        // (since this is the expected behavior in most cases)
-                        *fork_keep_mask &= !fork.match_any.modifiers;
-
-                        // Then add the user defined keeps (if any)
-                        *fork_keep_mask |= fork.kept_modifiers;
+                        // Matched modifiers stay kept unless suppressed; modifiers
+                        // pressed after activation re-add themselves to the mask
+                        *fork_keep_mask = (*fork_keep_mask | fork.match_any.modifiers) & !suppress;
 
                         if chain_starter.is_none() {
                             chain_starter = Some(i);
+                            starter_positive = decision;
                         }
 
                         if fork.bindable {
@@ -930,7 +958,7 @@ impl<'a> Keyboard<'a> {
                 break 'bind;
             }
 
-            (replacement, chain_starter, combined_suppress)
+            (replacement, chain_starter, combined_suppress, starter_positive)
         });
 
         if let Some(initial) = chain_starter {
@@ -941,6 +969,8 @@ impl<'a> Keyboard<'a> {
             self.fork_states[initial] = Some(ActiveFork {
                 replacement,
                 suppress: combined_suppress,
+                positive: starter_positive,
+                event,
             });
         }
 
@@ -961,6 +991,157 @@ impl<'a> Keyboard<'a> {
                     }
                 }
             });
+        }
+    }
+
+    fn is_modifier_action(key_action: &KeyAction) -> bool {
+        match key_action {
+            KeyAction::Single(Action::Modifier(_)) => true,
+            KeyAction::Single(Action::Key(KeyCode::Hid(key))) => key.is_modifier(),
+            _ => false,
+        }
+    }
+
+    /// Re-evaluate held fork triggers after this event changed the explicit
+    /// modifiers, switching branches mid-hold when the fork's activation
+    /// options allow it (QMK key override semantics).
+    async fn reevaluate_forks(&mut self, event: KeyboardEvent) {
+        if self.keymap.forks_is_empty() {
+            return;
+        }
+
+        let decision_state = StateBits {
+            modifiers: self.resolve_explicit_modifiers(event.pressed),
+            leds: LedIndicator::from_bits(LOCK_LED_STATES.load(core::sync::atomic::Ordering::Relaxed)),
+            mouse: MouseButtons::from_bits(self.mouse.report.buttons),
+        };
+
+        let fork_states = &self.fork_states;
+        let mut swaps: heapless::Vec<ForkSwap, FORK_MAX_NUM> = heapless::Vec::new();
+        self.keymap.with_forks(|forks| {
+            for (i, fork) in forks.iter().enumerate() {
+                let Some(active) = fork_states[i] else {
+                    continue;
+                };
+                // Chains keep their press-time decision; forks without mid-hold
+                // activation options keep their decision latched (legacy behavior)
+                if fork.bindable || !fork.options.reevaluates_mid_hold() {
+                    continue;
+                }
+                let positive = fork.is_positive(decision_state);
+                if positive == active.positive {
+                    continue;
+                }
+                if positive {
+                    // Mid-hold activation is gated by the event that caused it
+                    let allowed = if event.pressed {
+                        fork.options.activate_on_required_mod_down()
+                    } else {
+                        fork.options.activate_on_negative_mod_up()
+                    };
+                    if !allowed {
+                        continue;
+                    }
+                    let _ = swaps.push(ForkSwap {
+                        idx: i,
+                        active,
+                        output: fork.positive_output,
+                        suppress: fork.suppressed_modifiers,
+                        match_any_mods: fork.match_any.modifiers,
+                        positive: true,
+                    });
+                } else {
+                    // Deactivation when the state no longer matches is not gated
+                    let _ = swaps.push(ForkSwap {
+                        idx: i,
+                        active,
+                        output: if fork.options.no_reregister_trigger() {
+                            KeyAction::No
+                        } else {
+                            fork.negative_output
+                        },
+                        suppress: ModifierCombination::new(),
+                        match_any_mods: fork.match_any.modifiers,
+                        positive: false,
+                    });
+                }
+            }
+        });
+
+        for swap in swaps {
+            self.swap_fork_output(swap).await;
+        }
+    }
+
+    /// Deactivate active positive forks when an unrelated, non-modifier key
+    /// goes down (QMK key override semantics; a fork opts out with
+    /// `no_unregister_on_other_key_down`).
+    async fn deactivate_forks_on_other_key(&mut self, key_action: &KeyAction) {
+        if self.keymap.forks_is_empty() || Self::is_modifier_action(key_action) {
+            return;
+        }
+
+        let fork_states = &self.fork_states;
+        let mut swaps: heapless::Vec<ForkSwap, FORK_MAX_NUM> = heapless::Vec::new();
+        self.keymap.with_forks(|forks| {
+            for (i, fork) in forks.iter().enumerate() {
+                if let Some(active) = fork_states[i]
+                    && active.positive
+                    && !fork.bindable
+                    && !fork.options.no_unregister_on_other_key_down()
+                    && fork.trigger != *key_action
+                {
+                    let _ = swaps.push(ForkSwap {
+                        idx: i,
+                        active,
+                        output: if fork.options.no_reregister_trigger() {
+                            KeyAction::No
+                        } else {
+                            fork.negative_output
+                        },
+                        suppress: ModifierCombination::new(),
+                        match_any_mods: fork.match_any.modifiers,
+                        positive: false,
+                    });
+                }
+            }
+        });
+
+        for swap in swaps {
+            self.swap_fork_output(swap).await;
+        }
+    }
+
+    /// Swap a held fork's registered output mid-hold: release the old output,
+    /// then press the new one. Only simple key actions can be swapped.
+    async fn swap_fork_output(&mut self, swap: ForkSwap) {
+        let swappable = |a: &KeyAction| matches!(a, KeyAction::No | KeyAction::Single(_));
+        if !swappable(&swap.active.replacement) || !swappable(&swap.output) {
+            return;
+        }
+
+        debug!("fork output swap: {:?} -> {:?}", swap.active.replacement, swap.output);
+
+        // Update the modifier suppression before any report goes out
+        self.with_modifiers &= !swap.suppress;
+        self.fork_keep_mask = (self.fork_keep_mask | swap.match_any_mods) & !swap.suppress;
+        self.fork_states[swap.idx] = Some(ActiveFork {
+            replacement: swap.output,
+            suppress: swap.suppress,
+            positive: swap.positive,
+            event: swap.active.event,
+        });
+
+        // Release the old output, then press the new one
+        if let KeyAction::Single(action) = swap.active.replacement {
+            let mut release = swap.active.event;
+            release.pressed = false;
+            self.process_key_action_normal(action, release).await;
+        }
+        if let KeyAction::Single(action) = swap.output {
+            let mut press = swap.active.event;
+            press.pressed = true;
+            self.process_key_action_normal(action, press).await;
         }
     }
 
@@ -1421,8 +1602,7 @@ impl<'a> Keyboard<'a> {
         // "explicit" modifiers: one-shot modifier, registered held modifiers:
         let mut result = self.resolve_explicit_modifiers(pressed);
 
-        // The triggered forks suppress the 'match_any' modifiers automatically
-        // unless they are configured as the 'kept_modifiers'
+        // The triggered forks suppress their configured 'suppressed_modifiers'
         let mut fork_suppress = ModifierCombination::default();
         for fork_state in self.fork_states.iter().flatten() {
             fork_suppress |= fork_state.suppress;
@@ -2047,7 +2227,7 @@ mod test {
 
     use embassy_time::Duration;
     use rmk_types::action::KeyAction;
-    use rmk_types::fork::Fork;
+    use rmk_types::fork::{Fork, ForkOptions};
     use rmk_types::modifier::ModifierCombination;
     use rmk_types::morse::{MorseMode, MorseProfile};
 
@@ -2354,9 +2534,11 @@ mod test {
                     leds: LedIndicator::default(),
                     mouse: MouseButtons::default(),
                 },
-                match_none: StateBits::default(),
-                kept_modifiers: ModifierCombination::default(),
-                bindable: false,
+                suppressed_modifiers: ModifierCombination::default()
+                    .with_left_shift(true)
+                    .with_right_shift(true),
+                options: ForkOptions::default(),
+                ..Fork::empty()
             };
 
             //{ trigger = "Comma", negative_output = "Comma", positive_output = "Semicolon", match_any = "LShift|RShift" },
@@ -2371,9 +2553,11 @@ mod test {
                     leds: LedIndicator::default(),
                     mouse: MouseButtons::default(),
                 },
-                match_none: StateBits::default(),
-                kept_modifiers: ModifierCombination::default(),
-                bindable: false,
+                suppressed_modifiers: ModifierCombination::default()
+                    .with_left_shift(true)
+                    .with_right_shift(true),
+                options: ForkOptions::default(),
+                ..Fork::empty()
             };
 
             let mut keyboard = create_test_keyboard_with_forks(fork1, fork2);
@@ -2442,6 +2626,274 @@ mod test {
 
         block_on(main);
     }
+
+    #[test]
+    fn test_fork_match_all_modifiers() {
+        let main = async {
+            // Ctrl+Shift (either side, QMK pairing) turns Dot into Semicolon
+            let fork1 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: StateBits {
+                    modifiers: ModifierCombination::from_bits(0x33), // LCtrl|LShift|RCtrl|RShift
+                    leds: LedIndicator::default(),
+                    mouse: MouseButtons::default(),
+                },
+                options: ForkOptions::default().with_one_mod(false),
+                ..Fork::empty()
+            };
+
+            let mut keyboard = create_test_keyboard_with_forks(fork1, Fork::empty());
+
+            // Shift alone does not satisfy the AND condition
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Dot);
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+
+            // Ctrl+Shift does
+            keyboard.process_inner(KeyboardEvent::key(4, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+            keyboard.process_inner(KeyboardEvent::key(4, 0, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+        };
+
+        block_on(main);
+    }
+
+    #[test]
+    fn test_fork_layer_gate() {
+        let main = async {
+            let shifts = StateBits {
+                modifiers: ModifierCombination::from_bits(0x22), // LShift|RShift
+                leds: LedIndicator::default(),
+                mouse: MouseButtons::default(),
+            };
+            // Only on layer 1: Shift turns F1 into F2
+            let fork1 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::F1))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::F1))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::F2))),
+                match_any: shifts,
+                layers: Some(1 << 1),
+                options: ForkOptions::default(),
+                ..Fork::empty()
+            };
+            // Only on layer 1: Shift turns Kc1 into Kc2 — must not fire for
+            // the Kc1 sourced from layer 0
+            let fork2 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Kc1))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Kc1))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Kc2))),
+                match_any: shifts,
+                layers: Some(1 << 1),
+                options: ForkOptions::default(),
+                ..Fork::empty()
+            };
+
+            let mut keyboard = create_test_keyboard_with_forks(fork1, fork2);
+
+            // Hold shift; Kc1 comes from layer 0, so its fork is gated off
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(0, 1, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Kc1);
+            keyboard.process_inner(KeyboardEvent::key(0, 1, false)).await;
+
+            // Activate layer 1: the same key now sources F1, whose fork applies
+            keyboard.process_inner(KeyboardEvent::key(4, 9, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(0, 1, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::F2);
+            keyboard.process_inner(KeyboardEvent::key(0, 1, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+            keyboard.process_inner(KeyboardEvent::key(4, 9, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+        };
+
+        block_on(main);
+    }
+
+    fn shifts() -> StateBits {
+        StateBits {
+            modifiers: ModifierCombination::from_bits(0x22), // LShift|RShift
+            leds: LedIndicator::default(),
+            mouse: MouseButtons::default(),
+        }
+    }
+
+    #[test]
+    fn test_fork_mid_hold_activation_and_deactivation() {
+        let main = async {
+            // QMK-default options: activate/deactivate while the trigger is held
+            let fork1 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: shifts(),
+                suppressed_modifiers: ModifierCombination::from_bits(0x22),
+                options: ForkOptions::qmk_default(),
+                ..Fork::empty()
+            };
+            // Negative-mod-up activation: Shift+Comma is Semicolon only without Alt
+            let fork2 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Comma))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Comma))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: shifts(),
+                match_none: StateBits {
+                    modifiers: ModifierCombination::from_bits(0x44), // LAlt|RAlt
+                    ..StateBits::default()
+                },
+                suppressed_modifiers: ModifierCombination::from_bits(0x22),
+                options: ForkOptions::qmk_default(),
+                ..Fork::empty()
+            };
+
+            let mut keyboard = create_test_keyboard_with_forks(fork1, fork2);
+
+            // Press Dot alone: negative branch
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Dot);
+
+            // Pressing LShift mid-hold activates the fork: Dot becomes Semicolon
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+            // The shift is suppressed
+            assert_eq!(keyboard.resolve_modifiers(true), ModifierCombination::new());
+
+            // Releasing LShift mid-hold deactivates it: back to Dot
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Dot);
+
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+
+            // Negative-mod-up: hold LShift + LAlt, Comma stays Comma
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(4, 2, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 8, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Comma);
+
+            // Releasing LAlt activates the fork mid-hold
+            keyboard.process_inner(KeyboardEvent::key(4, 2, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+
+            keyboard.process_inner(KeyboardEvent::key(3, 8, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+        };
+
+        block_on(main);
+    }
+
+    #[test]
+    fn test_fork_deactivate_on_other_key_down() {
+        let main = async {
+            let fork1 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: shifts(),
+                suppressed_modifiers: ModifierCombination::from_bits(0x22),
+                options: ForkOptions::qmk_default(),
+                ..Fork::empty()
+            };
+            // Same, but the negative output is not re-registered on deactivation
+            let fork2 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Comma))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Comma))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: shifts(),
+                suppressed_modifiers: ModifierCombination::from_bits(0x22),
+                options: ForkOptions::qmk_default().with_no_reregister_trigger(true),
+                ..Fork::empty()
+            };
+
+            let mut keyboard = create_test_keyboard_with_forks(fork1, fork2);
+
+            // Shift+Dot: positive branch
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+
+            // Pressing Q deactivates the fork: Dot is re-registered, Q joins it
+            keyboard.process_inner(KeyboardEvent::key(1, 1, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Dot);
+            assert!(keyboard.held_keycodes.contains(&HidKeyCode::Q));
+            // The shift suppression is lifted
+            assert_eq!(
+                keyboard.resolve_modifiers(true),
+                ModifierCombination::new().with_left_shift(true)
+            );
+
+            keyboard.process_inner(KeyboardEvent::key(1, 1, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+
+            // Shift+Comma with no_reregister: deactivation registers nothing
+            keyboard.process_inner(KeyboardEvent::key(3, 8, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+            keyboard.process_inner(KeyboardEvent::key(1, 1, true)).await;
+            assert!(!keyboard.held_keycodes.contains(&HidKeyCode::Semicolon));
+            assert!(!keyboard.held_keycodes.contains(&HidKeyCode::Comma));
+            assert!(keyboard.held_keycodes.contains(&HidKeyCode::Q));
+
+            keyboard.process_inner(KeyboardEvent::key(1, 1, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 8, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+            assert!(keyboard.held_keycodes.iter().all(|k| *k == HidKeyCode::No));
+        };
+
+        block_on(main);
+    }
+
+    #[test]
+    fn test_fork_default_options_latch_decision() {
+        let main = async {
+            // Default options (TOML forks): the decision is made at trigger
+            // press and latched until release
+            let fork1 = Fork {
+                trigger: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                negative_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Dot))),
+                positive_output: KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Semicolon))),
+                match_any: shifts(),
+                suppressed_modifiers: ModifierCombination::from_bits(0x22),
+                options: ForkOptions::default(),
+                ..Fork::empty()
+            };
+
+            let mut keyboard = create_test_keyboard_with_forks(fork1, Fork::empty());
+
+            // Shift+Dot: positive branch
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+
+            // Neither releasing the shift nor pressing another key changes the decision
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+            keyboard.process_inner(KeyboardEvent::key(1, 1, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Semicolon);
+
+            keyboard.process_inner(KeyboardEvent::key(1, 1, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+            assert!(keyboard.held_keycodes.iter().all(|k| *k == HidKeyCode::No));
+
+            // And pressing the shift after the trigger doesn't activate it
+            keyboard.process_inner(KeyboardEvent::key(3, 9, true)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, true)).await;
+            assert_eq!(keyboard.held_keycodes[0], HidKeyCode::Dot);
+
+            keyboard.process_inner(KeyboardEvent::key(3, 9, false)).await;
+            keyboard.process_inner(KeyboardEvent::key(3, 0, false)).await;
+        };
+
+        block_on(main);
+    }
+
     #[test]
     fn test_fork_with_held_mouse_button() {
         let main = async {
@@ -2459,11 +2911,11 @@ mod test {
                     leds: LedIndicator::default(),
                     mouse: MouseButtons::default(),
                 },
-                match_none: StateBits::default(),
-                kept_modifiers: ModifierCombination::default()
-                    .with_left_shift(true)
-                    .with_right_shift(true),
-                bindable: false,
+                suppressed_modifiers: ModifierCombination::default()
+                    .with_left_ctrl(true)
+                    .with_right_ctrl(true),
+                options: ForkOptions::default(),
+                ..Fork::empty()
             };
 
             //{ trigger = "A", negative_output = "S", positive_output = "D", match_any = "MouseBtn5" },
@@ -2476,9 +2928,8 @@ mod test {
                     leds: LedIndicator::default(),
                     mouse: MouseButtons::default().with_button5(true),
                 },
-                match_none: StateBits::default(),
-                kept_modifiers: ModifierCombination::default(),
-                bindable: false,
+                options: ForkOptions::default(),
+                ..Fork::empty()
             };
 
             let mut keyboard = create_test_keyboard_with_forks(fork1, fork2);

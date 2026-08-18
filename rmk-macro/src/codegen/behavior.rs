@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use quote::quote;
-use rmk_config::resolved::Behavior;
 use rmk_config::resolved::behavior::{
     AutoMouseLayer, Combos, Forks, MacroOperation, Macros, Morse, MorseActionPair, MorseKey,
     MorseProfile, OneShot,
 };
+use rmk_config::resolved::Behavior;
 
 use super::action_parser::{expand_profile, expand_profile_name, get_key_with_alias, parse_key};
 
@@ -469,7 +469,12 @@ fn expand_forks(
                     panic!("\n❌ keyboard.toml: fork configuration missing match conditions! Please check the documentation: https://rmk.rs/docs/features/configuration/behavior.html#fork");
                 }
 
-                quote! { ::rmk::types::fork::Fork::new(#trigger, #negative_output, #positive_output, #match_any, #match_none, #kept.modifiers, #bindable) }
+                // The TOML `kept_modifiers` lists the matched modifiers to keep
+                // reported; `Fork` stores the inverse (the suppressed set)
+                quote! {{
+                    let match_any = #match_any;
+                    ::rmk::types::fork::Fork::new(#trigger, #negative_output, #positive_output, match_any, #match_none, match_any.modifiers & !(#kept.modifiers), #bindable)
+                }}
             });
 
             quote! {

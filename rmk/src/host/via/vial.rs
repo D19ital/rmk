@@ -1,8 +1,12 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmk_types::action::KeyAction;
-use rmk_types::constants::{COMBO_MAX_LENGTH, COMBO_MAX_NUM, MORSE_MAX_NUM};
+use rmk_types::constants::{COMBO_MAX_LENGTH, COMBO_MAX_NUM, FORK_MAX_NUM, MORSE_MAX_NUM};
+use rmk_types::fork::{Fork, ForkOptions, StateBits};
+use rmk_types::modifier::ModifierCombination;
 use rmk_types::morse::{DOUBLE_TAP, HOLD, HOLD_AFTER_TAP, Morse, MorseMode, TAP};
-use rmk_types::protocol::vial::{SettingKey, VIAL_EP_SIZE, VIAL_PROTOCOL_VERSION, VialCommand, VialDynamic};
+use rmk_types::protocol::vial::{
+    SettingKey, VIAL_EP_SIZE, VIAL_KEY_OVERRIDE_OPTION_BITS, VIAL_PROTOCOL_VERSION, VialCommand, VialDynamic,
+};
 
 #[cfg(feature = "storage")]
 use crate::channel::FLASH_CHANNEL;
@@ -288,8 +292,7 @@ pub(crate) async fn process_vial<'a>(
                     debug!("DynamicEntryOp - DynamicVialGetNumberOfEntries");
                     report.input_data[0] = core::cmp::min(MORSE_MAX_NUM, 255) as u8; // Tap dance entries
                     report.input_data[1] = core::cmp::min(COMBO_MAX_NUM, 255) as u8; // Combo entries
-                    // TODO: Support dynamic key override
-                    report.input_data[2] = 0; // Key override entries
+                    report.input_data[2] = core::cmp::min(FORK_MAX_NUM, 255) as u8; // Key override entries
                     report.input_data[31] = 1 // Enable caps word
                 }
                 VialDynamic::DynamicVialMorseGet => {
@@ -405,12 +408,21 @@ pub(crate) async fn process_vial<'a>(
                     ctx.set_combo(combo_idx, config).await;
                 }
                 VialDynamic::DynamicVialKeyOverrideGet => {
-                    warn!("DynamicEntryOp - DynamicVialKeyOverrideGet -- to be implemented");
-                    report.input_data.fill(0x00);
+                    debug!("DynamicEntryOp - DynamicVialKeyOverrideGet");
+                    report.input_data[0] = 0; // Index 0 is the return code, 0 means success
+
+                    let fork_idx = report.output_data[3] as usize;
+                    let entry =
+                        ctx.with_forks(|forks| forks.get(fork_idx).map(fork_to_vial_key_override).unwrap_or_default());
+                    report.input_data[1..11].copy_from_slice(&entry);
                 }
                 VialDynamic::DynamicVialKeyOverrideSet => {
-                    warn!("DynamicEntryOp - DynamicVialKeyOverrideSet -- to be implemented");
-                    report.input_data.fill(0x00);
+                    debug!("DynamicEntryOp - DynamicVialKeyOverrideSet");
+                    report.input_data[0] = 0; // Index 0 is the return code, 0 means success
+
+                    let fork_idx = report.output_data[3];
+                    let fork = vial_key_override_to_fork(&report.output_data[4..14]);
+                    ctx.set_fork(fork_idx, fork).await;
                 }
                 VialDynamic::Unhandled => {
                     warn!("DynamicEntryOp - Unhandled -- subcommand not recognized");
@@ -457,12 +469,62 @@ pub(crate) async fn process_vial<'a>(
     }
 }
 
+/// Serialize a fork into Vial's 10-byte `vial_key_override_entry_t` (little endian).
+///
+/// Best-effort where forks are richer than key overrides: LED/mouse match
+/// conditions and a custom `negative_output` are not representable.
+fn fork_to_vial_key_override(fork: &Fork) -> [u8; 10] {
+    let mut entry = [0u8; 10];
+    if fork.trigger == KeyAction::No {
+        return entry;
+    }
+    LittleEndian::write_u16(&mut entry[0..2], to_via_keycode(fork.trigger));
+    LittleEndian::write_u16(&mut entry[2..4], to_via_keycode(fork.positive_output));
+    LittleEndian::write_u16(&mut entry[4..6], fork.layers.unwrap_or(0xFFFF));
+    entry[6] = fork.match_any.modifiers.into_bits();
+    entry[7] = fork.match_none.modifiers.into_bits();
+    entry[8] = fork.suppressed_modifiers.into_bits();
+    entry[9] = fork.options.into_bits() & VIAL_KEY_OVERRIDE_OPTION_BITS;
+    entry
+}
+
+/// Deserialize Vial's 10-byte `vial_key_override_entry_t` into a fork.
+fn vial_key_override_to_fork(entry: &[u8]) -> Fork {
+    let trigger = from_via_keycode(LittleEndian::read_u16(&entry[0..2]));
+    if trigger == KeyAction::No {
+        return Fork::empty();
+    }
+    let layers = LittleEndian::read_u16(&entry[4..6]);
+    Fork {
+        trigger,
+        // Pass the trigger through when the condition is not met
+        negative_output: trigger,
+        positive_output: from_via_keycode(LittleEndian::read_u16(&entry[2..4])),
+        match_any: StateBits {
+            modifiers: ModifierCombination::from_bits(entry[6]),
+            ..Default::default()
+        },
+        match_none: StateBits {
+            modifiers: ModifierCombination::from_bits(entry[7]),
+            ..Default::default()
+        },
+        suppressed_modifiers: ModifierCombination::from_bits(entry[8]),
+        layers: if layers == 0xFFFF { None } else { Some(layers) },
+        options: ForkOptions::from_bits(entry[9] & VIAL_KEY_OVERRIDE_OPTION_BITS),
+        // QMK key overrides don't cascade
+        bindable: false,
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "storage")]
 mod tests {
     use rmk_types::action::Action;
     use rmk_types::combo::Combo as ComboConfig;
     use rmk_types::keycode::{HidKeyCode, KeyCode};
+    use rmk_types::protocol::vial::{
+        VIAL_KEY_OVERRIDE_ALL_ACTIVATIONS, VIAL_KEY_OVERRIDE_ENABLED, VIAL_KEY_OVERRIDE_ONE_MOD,
+    };
     use sequential_storage::map::Value;
 
     use super::*;
@@ -490,6 +552,109 @@ mod tests {
                 assert_eq!(deserialized_config, combo_config);
             }
             _ => panic!("Expected Combo"),
+        }
+    }
+
+    // Shift+Backspace -> Delete, the canonical key override
+    fn shift_backspace_wire_entry() -> [u8; 10] {
+        let mut wire = [0u8; 10];
+        LittleEndian::write_u16(&mut wire[0..2], HidKeyCode::Backspace as u16);
+        LittleEndian::write_u16(&mut wire[2..4], HidKeyCode::Delete as u16);
+        LittleEndian::write_u16(&mut wire[4..6], 0xFFFF); // all layers
+        wire[6] = 0x22; // trigger_mods: LShift | RShift
+        wire[7] = 0x44; // negative_mod_mask: LAlt | RAlt
+        wire[8] = 0x02; // suppressed_mods: LShift
+        wire[9] = VIAL_KEY_OVERRIDE_ENABLED | VIAL_KEY_OVERRIDE_ALL_ACTIVATIONS | VIAL_KEY_OVERRIDE_ONE_MOD;
+        wire
+    }
+
+    #[test]
+    fn test_key_override_wire_roundtrip() {
+        let wire = shift_backspace_wire_entry();
+        let fork = vial_key_override_to_fork(&wire);
+
+        assert!(fork.options.enabled());
+        assert!(!fork.bindable);
+        assert_eq!(
+            fork.trigger,
+            KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Backspace)))
+        );
+        assert_eq!(fork.negative_output, fork.trigger);
+        assert_eq!(
+            fork.positive_output,
+            KeyAction::Single(Action::Key(KeyCode::Hid(HidKeyCode::Delete)))
+        );
+        assert_eq!(fork.match_any.modifiers.into_bits(), 0x22);
+        assert_eq!(fork.match_none.modifiers.into_bits(), 0x44);
+        assert_eq!(fork.suppressed_modifiers.into_bits(), 0x02);
+        assert!(fork.options.one_mod());
+        assert_eq!(fork.layers, None); // 0xFFFF = all layers
+
+        assert_eq!(fork_to_vial_key_override(&fork), wire);
+    }
+
+    #[test]
+    fn test_key_override_all_mode_layers_and_free_suppress() {
+        let mut wire = shift_backspace_wire_entry();
+        wire[9] &= !VIAL_KEY_OVERRIDE_ONE_MOD; // AND semantics (QMK default)
+        LittleEndian::write_u16(&mut wire[4..6], 0x0005); // layers 0 and 2 only
+        wire[8] = 0x44; // suppress LAlt|RAlt, none of which are trigger mods
+
+        let fork = vial_key_override_to_fork(&wire);
+        assert!(!fork.options.one_mod()); // QMK AND semantics
+        assert_eq!(fork.layers, Some(0x0005));
+        assert_eq!(fork.suppressed_modifiers.into_bits(), 0x44);
+
+        assert_eq!(fork_to_vial_key_override(&fork), wire);
+    }
+
+    #[test]
+    fn test_key_override_option_bits_roundtrip() {
+        let mut wire = shift_backspace_wire_entry();
+        // Only mod-down activation + both "no" bits
+        wire[9] = VIAL_KEY_OVERRIDE_ENABLED | 0b0011_0010;
+
+        let fork = vial_key_override_to_fork(&wire);
+        assert!(!fork.options.activate_on_trigger_down());
+        assert!(fork.options.activate_on_required_mod_down());
+        assert!(!fork.options.activate_on_negative_mod_up());
+        assert!(fork.options.no_reregister_trigger());
+        assert!(fork.options.no_unregister_on_other_key_down());
+        assert!(!fork.options.one_mod());
+        assert!(fork.options.enabled());
+
+        assert_eq!(fork_to_vial_key_override(&fork), wire);
+    }
+
+    #[test]
+    fn test_key_override_empty_and_disabled() {
+        // An all-zero wire entry maps to the empty fork and back
+        let fork = vial_key_override_to_fork(&[0u8; 10]);
+        assert_eq!(fork, Fork::empty());
+        assert_eq!(fork_to_vial_key_override(&fork), [0u8; 10]);
+
+        // A disabled entry keeps its configuration
+        let mut wire = shift_backspace_wire_entry();
+        wire[9] &= !VIAL_KEY_OVERRIDE_ENABLED;
+        let fork = vial_key_override_to_fork(&wire);
+        assert!(!fork.options.enabled());
+        assert_eq!(fork.match_any.modifiers.into_bits(), 0x22);
+        assert_eq!(fork_to_vial_key_override(&fork), wire);
+    }
+
+    #[test]
+    fn test_fork_serialization_deserialization() {
+        let wire = shift_backspace_wire_entry();
+        let fork = vial_key_override_to_fork(&wire);
+        let mut buffer = [0u8; 64];
+        let storage_data = StorageData::Fork(fork);
+        let serialized_size = Value::serialize_into(&storage_data, &mut buffer).unwrap();
+        let deserialized_data = StorageData::deserialize_from(&buffer[..serialized_size]).unwrap();
+        match deserialized_data {
+            (StorageData::Fork(deserialized_fork), _) => {
+                assert_eq!(deserialized_fork, fork);
+            }
+            _ => panic!("Expected Fork"),
         }
     }
 }

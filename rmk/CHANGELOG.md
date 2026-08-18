@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `bootmagic` config: hold a designated key during boot to drop into the chip bootloader. Works on unibody and on each half of a split independently. Particularly useful for split peripherals whose BOOTSEL button is physically inaccessible ([#457](https://github.com/HaoboGu/rmk/issues/457)).
 - Make `rmk::boot` module public so user code can call `boot::jump_to_bootloader()` directly
 - Add auto mouse layer behavior: automatically activate a configured layer when X/Y cursor motion from a pointing device is detected, and deactivate it after a `timeout` of inactivity ([#781](https://github.com/HaoboGu/rmk/issues/781)) with `deactivate_on_key` (with `extra_mouse_keys`) and `reset_timeout_on_key` options; entry capacity is auto-derived from `keyboard.toml`, overridable via `[rmk].auto_mouse_layer_max_num`
+- Add Vial Key Override support backed by RMK Fork: eight editable entries by default, immediate application, flash persistence, layer masks, modifier suppression, QMK AND/OR matching, enable state, and activation/deactivation option bits
 
 ### Changed
 
+- **BREAKING**: the Rust `Fork` API replaces `kept_modifiers` with its inverse, `suppressed_modifiers`, and adds `layers` plus Vial-compatible `options`; `keyboard.toml` keeps the existing `kept_modifiers` field and behavior
 - **BREAKING**: `CompositeReportType` discriminants are renumbered (`Keyboard=1`, `Mouse=2`, `Media=3`, `System=4`): the BLE report map carries the keyboard report as id 1, and the mouse/media/system report ids shift to 2/3/4 on both BLE and USB. USB hosts re-read report ids on every enumeration so nothing changes for them; BLE hosts bonded to an older firmware must forget and re-pair the keyboard
 - **BREAKING**: `PollingController::INTERVAL` constant is now `PollingController::interval()` method, allowing dynamic interval configuration at runtime
 - **BREAKING**: PointingDevice and PointingProcessor replace Pmw3610Device and Pmw3610Processor. For the Pmw3610 the calls of ::new() for these stay the same, only the name changes. If using Rust to configure the keyboard change the calls, if using Toml nothing needs to be done.

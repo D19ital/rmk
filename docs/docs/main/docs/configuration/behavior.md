@@ -448,6 +448,8 @@ keymap = [
 
 In the `fork` sub-table, you can configure the keyboard's state-based key fork functionality. Forks allow you to define a trigger key and condition-dependent possible replacement keys. When the trigger key is pressed, the condition is checked by the following rule: If any of the `match_any` states are active AND none of the `match_none` states are active, the trigger key will be replaced with positive_output; otherwise, it will be replaced with the negative_output. By default, the modifiers listed in `match_any` will be suppressed (even the one-shot modifiers) for the time the replacement key action is executed. However, with `kept_modifiers` some of them can be kept instead of automatic suppression.
 
+Forks also power Vial's Key Override feature: entries edited in the Key Override tab use the same fork slots, take effect immediately, and persist to flash.
+
 Fork configuration includes the following parameters:
 
 - `forks`: An array containing all defined forks. Each fork configuration is an object containing the following attributes:
