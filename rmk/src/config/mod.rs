@@ -31,6 +31,4 @@ pub struct RmkConfig<'a> {
     pub storage_config: StorageConfig,
     #[cfg(feature = "_ble")]
     pub ble_battery_config: BleBatteryConfig<'a>,
-    #[cfg(feature = "_ble")]
-    pub ble_host_power_config: Option<BleHostPowerConfig>,
 }

@@ -295,7 +295,11 @@ fn transport_setup(communication: &CommunicationConfig) -> (TokenStream2, Vec<To
         CommunicationConfig::Ble(_) => {
             let prelude = quote! {
                 #wpm_prelude
-                let mut ble_transport = ::rmk::ble::BleTransport::new(&stack, rmk_config).await;
+                let mut ble_transport = ::rmk::ble::BleTransport::new_with_host_power_config(
+                    &stack,
+                    rmk_config,
+                    ble_host_power_config,
+                ).await;
             };
             (prelude, vec![quote! { ble_transport.run() }, wpm_task])
         }
@@ -303,7 +307,11 @@ fn transport_setup(communication: &CommunicationConfig) -> (TokenStream2, Vec<To
             let prelude = quote! {
                 #wpm_prelude
                 let mut usb_transport = ::rmk::usb::UsbTransport::new(driver, rmk_config.device_config);
-                let mut ble_transport = ::rmk::ble::BleTransport::new(&stack, rmk_config).await;
+                let mut ble_transport = ::rmk::ble::BleTransport::new_with_host_power_config(
+                    &stack,
+                    rmk_config,
+                    ble_host_power_config,
+                ).await;
             };
             (
                 prelude,

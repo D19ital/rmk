@@ -115,6 +115,18 @@ where
         + ControllerCmdSync<LeReadPhy>,
 {
     pub async fn new(stack: &'b Stack<'s, C, DefaultPacketPool>, rmk_config: RmkConfig<'static>) -> Self {
+        Self::new_with_host_power_config(stack, rmk_config, None).await
+    }
+
+    /// Create a BLE transport with an optional host-link power policy.
+    ///
+    /// Generated keyboards use this constructor so handwritten `RmkConfig`
+    /// initializers remain source-compatible with earlier RMK versions.
+    pub async fn new_with_host_power_config(
+        stack: &'b Stack<'s, C, DefaultPacketPool>,
+        rmk_config: RmkConfig<'static>,
+        host_power_config: Option<BleHostPowerConfig>,
+    ) -> Self {
         #[cfg(feature = "_nrf_ble")]
         let serial_number = crate::ble::nrf::get_serial_number();
         #[cfg(not(feature = "_nrf_ble"))]
@@ -164,7 +176,7 @@ where
             profile_manager,
             product_name: rmk_config.device_config.product_name,
             config: rmk_config.ble_battery_config,
-            host_power_config: rmk_config.ble_host_power_config,
+            host_power_config,
         }
     }
 }
