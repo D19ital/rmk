@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 
+mod battery_level;
 mod battery_nrf;
 mod layer_led;
 mod module_settings;

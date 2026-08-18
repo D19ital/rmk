@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 
+mod battery_level;
 mod battery_nrf;
 #[path = "../../common/default_layer_names.rs"]
 mod default_layer_names;

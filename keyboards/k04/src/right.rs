@@ -1,6 +1,7 @@
 #![no_main]
 #![no_std]
 
+mod battery_level;
 mod battery_nrf;
 #[path = "qube_layer_led.rs"]
 mod layer_led;
