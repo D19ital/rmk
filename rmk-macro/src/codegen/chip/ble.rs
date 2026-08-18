@@ -1,7 +1,19 @@
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use rmk_config::resolved::Hardware;
 use rmk_config::resolved::hardware::{ChipSeries, CommunicationConfig};
+use rmk_config::resolved::Hardware;
+
+fn expand_host_power_config() -> TokenStream2 {
+    let config = std::env::var("RMK_BLE_HOST_POWER_CONFIG_FN")
+        .ok()
+        .and_then(|path| syn::parse_str::<syn::Path>(&path).ok())
+        .map(|path| quote! { Some(#path()) })
+        .unwrap_or_else(|| quote! { None });
+
+    quote! {
+        ble_host_power_config: #config,
+    }
+}
 
 // Default implementations of ble configuration.
 // Because ble configuration in `config` is enabled by a feature gate, so this function returns two TokenStreams.
@@ -10,6 +22,7 @@ pub(crate) fn expand_ble_config(hardware: &Hardware) -> (TokenStream2, TokenStre
     if !hardware.communication.ble_enabled() {
         return (quote! {}, quote! {});
     }
+    let host_power_config = expand_host_power_config();
     // Advanced parameters are only supported for nrf52(for now)
     if hardware.chip.series != ChipSeries::Nrf52 {
         return (
@@ -18,6 +31,7 @@ pub(crate) fn expand_ble_config(hardware: &Hardware) -> (TokenStream2, TokenStre
             },
             quote! {
                 ble_battery_config,
+                #host_power_config
             },
         );
     }
@@ -76,6 +90,7 @@ pub(crate) fn expand_ble_config(hardware: &Hardware) -> (TokenStream2, TokenStre
                     ble_config_tokens,
                     quote! {
                         ble_battery_config,
+                        #host_power_config
                     },
                 )
             } else {
@@ -85,6 +100,7 @@ pub(crate) fn expand_ble_config(hardware: &Hardware) -> (TokenStream2, TokenStre
                     },
                     quote! {
                         ble_battery_config,
+                        #host_power_config
                     },
                 )
             }

@@ -12,7 +12,7 @@ use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 
 use crate::SPLIT_CENTRAL_SLEEP_TIMEOUT_SECONDS;
-use crate::event::{KeyboardEvent, PointingEvent, SleepStateEvent, SubscribableEvent, publish_event};
+use crate::event::{EventSubscriber, KeyboardEvent, PointingEvent, SleepStateEvent, SubscribableEvent, publish_event};
 
 /// Latched keyboard sleep state for synchronous users such as the battery
 /// service. A blocking mutex keeps this compatible with ARMv6-M targets, which
@@ -22,6 +22,11 @@ static SLEEPING_STATE: BlockingMutex<crate::RawMutex, Cell<bool>> = BlockingMute
 /// Input to [`run_sleep_manager`]: `true` requests immediate sleep, while
 /// `false` reports activity and wakes or restarts the idle timeout.
 static SLEEP_INPUT: Signal<crate::RawMutex, bool> = Signal::new();
+
+/// Mirrored activity/suspend input for the host BLE power policy. Keeping a
+/// separate signal lets the persistent sleep manager and a connected host
+/// session observe every state change independently.
+static HOST_POWER_INPUT: Signal<crate::RawMutex, bool> = Signal::new();
 
 pub(crate) fn is_sleeping() -> bool {
     SLEEPING_STATE.lock(Cell::get)
@@ -34,6 +39,7 @@ fn set_sleeping(next: bool) {
 /// Report keyboard activity: wake the keyboard or restart its idle timeout.
 pub(crate) fn report_activity() {
     SLEEP_INPUT.signal(false);
+    HOST_POWER_INPUT.signal(false);
 }
 
 /// Report pointing activity only when the event represents real user input.
@@ -43,25 +49,53 @@ pub(crate) fn report_pointing_activity(event: &PointingEvent) {
     }
 }
 
-/// Wait for a key or a meaningful pointing report, ignoring sensor noise.
-pub(crate) async fn wait_for_input_activity() {
-    let mut key_wake = KeyboardEvent::subscriber();
-    let mut pointing_wake = PointingEvent::subscriber();
-    key_wake.clear();
-    pointing_wake.clear();
+/// Input subscriptions created before a host disconnect or advertising
+/// attempt so no wake event is lost in the transition window.
+pub(crate) struct InputActivityWaiter {
+    key_wake: <KeyboardEvent as SubscribableEvent>::Subscriber,
+    pointing_wake: <PointingEvent as SubscribableEvent>::Subscriber,
+}
 
-    loop {
-        match select(key_wake.next_message_pure(), pointing_wake.next_message_pure()).await {
-            Either::First(_) => return,
-            Either::Second(event) if event.is_user_activity() => return,
-            Either::Second(_) => {}
+impl InputActivityWaiter {
+    pub(crate) fn new() -> Self {
+        Self {
+            key_wake: KeyboardEvent::subscriber(),
+            pointing_wake: PointingEvent::subscriber(),
         }
     }
+
+    pub(crate) async fn wait(mut self) {
+        loop {
+            match select(self.key_wake.next_event(), self.pointing_wake.next_event()).await {
+                Either::First(_) => return,
+                Either::Second(event) if event.is_user_activity() => return,
+                Either::Second(_) => {}
+            }
+        }
+    }
+}
+
+/// Wait for a key or a meaningful pointing report, ignoring sensor noise.
+pub(crate) async fn wait_for_input_activity() {
+    InputActivityWaiter::new().wait().await;
+}
+
+pub(crate) fn reset_host_power_input() {
+    HOST_POWER_INPUT.reset();
+}
+
+pub(crate) async fn wait_for_host_power_input() -> bool {
+    HOST_POWER_INPUT.wait().await
+}
+
+pub(crate) fn take_host_power_input() -> Option<bool> {
+    HOST_POWER_INPUT.try_take()
 }
 
 /// Request sleep immediately instead of waiting for the idle timeout.
 pub(crate) fn request_sleep() {
     SLEEP_INPUT.signal(true);
+    HOST_POWER_INPUT.signal(true);
 }
 
 /// Run the single persistent sleep manager alongside the BLE transport.
@@ -109,6 +143,7 @@ mod tests {
 
     fn with_sleep_manager(script: impl core::future::Future<Output = ()>) {
         SLEEP_INPUT.reset();
+        HOST_POWER_INPUT.reset();
         set_sleeping(false);
         block_on(async {
             select(manage_sleep_state(Duration::from_secs(1)), script).await;

@@ -212,7 +212,7 @@ impl LayerLed {
             BleState::Connected => {
                 self.start_overlay(Overlay::HostConnected, indicator_duration());
             }
-            BleState::Advertising | BleState::Inactive => {
+            BleState::Advertising | BleState::Inactive | BleState::Sleeping => {
                 if previous == Some(BleState::Connected) {
                     self.overlay = None;
                 }
@@ -315,7 +315,7 @@ impl LayerLed {
             .connection_status
             .is_none_or(|status| status.preferred == ConnectionType::Ble);
         if show_host_ble_status {
-            if self.ble_state == BleState::Inactive {
+            if matches!(self.ble_state, BleState::Inactive | BleState::Sleeping) {
                 return color_off();
             }
 

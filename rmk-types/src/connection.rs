@@ -128,6 +128,12 @@ mod tests {
     }
 
     #[test]
+    fn sleeping_ble_is_not_routable_until_reconnected() {
+        let s = status(UsbState::Disabled, BleState::Sleeping, ConnectionType::Ble);
+        assert_eq!(s.decide_active(), None);
+    }
+
+    #[test]
     fn suspended_usb_stays_routable_for_remote_wakeup() {
         let s = status(UsbState::Suspended, BleState::Advertising, ConnectionType::Ble);
         assert_eq!(s.decide_active(), Some(ConnectionType::Usb));

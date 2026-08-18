@@ -6,9 +6,14 @@ use embassy_sync::channel::{Channel, TrySendError};
 #[cfg(any(feature = "_ble", all(feature = "storage", feature = "host")))]
 use embassy_sync::signal::Signal;
 pub use embassy_sync::{blocking_mutex, channel, pubsub, zerocopy_channel};
+#[cfg(feature = "_ble")]
+use embassy_time::{Duration, Timer};
 use rmk_types::connection::ConnectionType;
 #[cfg(feature = "_ble")]
-use {crate::ble::profile::BleProfileAction, rmk_types::led_indicator::LedIndicator};
+use {
+    crate::ble::profile::BleProfileAction,
+    rmk_types::{ble::BleState, led_indicator::LedIndicator},
+};
 
 #[cfg(all(feature = "storage", feature = "host"))]
 use crate::MACRO_SPACE_SIZE;
@@ -50,9 +55,21 @@ fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
     report_channel(transport).map(|ch| (transport, ch))
 }
 
-/// Reports generated while no transport is selected are dropped on the floor.
+/// Reports generated while no transport is selected are normally dropped.
+/// During BLE idle sleep, the producer waits for reconnection so the input
+/// that woke the keyboard is not lost.
 pub async fn send_hid_report(mut report: Report) {
-    let Some((transport, ch)) = active_report_channel() else {
+    let (transport, ch) = loop {
+        if let Some(active) = active_report_channel() {
+            break active;
+        }
+
+        #[cfg(feature = "_ble")]
+        if crate::state::current_ble_status().state == BleState::Sleeping {
+            Timer::after(Duration::from_millis(5)).await;
+            continue;
+        }
+
         return;
     };
 

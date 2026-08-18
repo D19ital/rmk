@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.8-rc.1
+
+### Features
+
+- Added two-stage host BLE power saving for standalone K:04, K:04 Mini, and K:04 Micro: low-duty connection parameters after two minutes, then a configurable full disconnect after 10 minutes to 5 hours
+- Preserved the first keyboard, encoder, trackball, or touchpad event while reconnecting after idle sleep
+
+### Fixes
+
+- Applied host disconnect timeout changes immediately and migrated existing v0.1.7 settings to the new 30-minute default
+
 ## v0.1.7
 
 ### Features

@@ -173,7 +173,11 @@ mod tests {
 
     use embassy_futures::select::{Either, select};
     use embassy_time::{Duration, Timer};
+    #[cfg(feature = "_ble")]
+    use rmk_types::ble::BleState;
 
+    #[cfg(feature = "_ble")]
+    use super::set_ble_state;
     use super::{
         CONNECTION_STATUS, ConnectionStatus, ConnectionType, UsbState, set_preferred_connection, set_usb_state,
     };
@@ -253,6 +257,32 @@ mod tests {
         match block_on(select(Timer::after(Duration::from_millis(1)), sub.next_event())) {
             Either::First(_) => {}
             Either::Second(event) => panic!("unexpected status change event: {:?}", event),
+        }
+    }
+
+    #[cfg(feature = "_ble")]
+    #[test]
+    fn first_report_waits_for_ble_sleep_reconnection() {
+        use embassy_futures::join::join;
+
+        use crate::channel::{BLE_REPORT_CHANNEL, send_hid_report};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        set_ble_state(BleState::Sleeping);
+
+        block_on(join(send_hid_report(pressed_keyboard_report()), async {
+            Timer::after(Duration::from_millis(1)).await;
+            assert!(BLE_REPORT_CHANNEL.try_receive().is_err());
+            set_ble_state(BleState::Connected);
+        }));
+
+        match BLE_REPORT_CHANNEL
+            .try_receive()
+            .expect("the wake report should be queued after BLE reconnects")
+        {
+            Report::KeyboardReport(report) => assert_eq!(report.keycodes[0], 4),
+            _ => panic!("expected keyboard wake report"),
         }
     }
 

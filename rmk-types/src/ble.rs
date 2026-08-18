@@ -16,6 +16,9 @@ pub enum BleState {
     Connected,
     /// The BLE is not in use (USB mode or sleep mode, default).
     Inactive,
+    /// The host link was intentionally disconnected after an idle timeout.
+    /// Input wakes advertising, and the first report waits for reconnection.
+    Sleeping,
 }
 
 /// Unified BLE status: which profile is active and what the BLE is doing.
@@ -62,9 +65,14 @@ mod tests {
             state: BleState::Connected,
         };
         let inactive = BleStatus::default();
+        let sleeping = BleStatus {
+            profile: 2,
+            state: BleState::Sleeping,
+        };
 
         assert_ne!(advertising, connected);
         assert_ne!(connected, inactive);
+        assert_ne!(sleeping, inactive);
         assert_eq!(
             inactive,
             BleStatus {
@@ -72,5 +80,14 @@ mod tests {
                 state: BleState::Inactive,
             }
         );
+    }
+
+    #[test]
+    fn sleeping_variant_preserves_existing_wire_discriminants() {
+        let mut buffer = [0u8; 1];
+        assert_eq!(postcard::to_slice(&BleState::Advertising, &mut buffer).unwrap(), &[0]);
+        assert_eq!(postcard::to_slice(&BleState::Connected, &mut buffer).unwrap(), &[1]);
+        assert_eq!(postcard::to_slice(&BleState::Inactive, &mut buffer).unwrap(), &[2]);
+        assert_eq!(postcard::to_slice(&BleState::Sleeping, &mut buffer).unwrap(), &[3]);
     }
 }
