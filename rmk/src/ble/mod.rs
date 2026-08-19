@@ -754,18 +754,31 @@ async fn advertise<'a, 'b, C: Controller>(
 
         let remaining_reconnect_ms = reconnect_timeout_ms.saturating_sub(high_duty_window_ms);
         if remaining_reconnect_ms > 0 {
-            info!("[adv] directed reconnect");
+            // Directed advertising is not rediscovered reliably by every host
+            // after a peripheral-initiated idle disconnect. Fall back to an
+            // undirected advertisement restricted to the bonded peer: the OS
+            // can scan and reconnect normally, while a new host still cannot
+            // connect or start pairing.
+            peripheral.set_filter_accept_list(&[peer]).await?;
+            let bonded_reconnect_config = AdvertisementParameters {
+                filter_policy: bonded_reconnect_filter_policy(),
+                ..slow_advertise_config
+            };
+            info!("[adv] filtered bonded-host reconnect");
             let advertiser = peripheral
                 .advertise(
-                    &slow_advertise_config,
-                    Advertisement::ConnectableNonscannableDirected { peer },
+                    &bonded_reconnect_config,
+                    Advertisement::ConnectableScannableUndirected {
+                        adv_data: &advertiser_data[..],
+                        scan_data: &[],
+                    },
                 )
                 .await?;
             match with_timeout(Duration::from_millis(remaining_reconnect_ms), advertiser.accept()).await {
                 Ok(conn_res) => {
                     let conn = conn_res?.with_attribute_server(server)?;
-                    info!("[adv] directed connection established");
-                    if let Err(e) = conn.raw().set_bondable(true) {
+                    info!("[adv] bonded host connection established");
+                    if let Err(e) = conn.raw().set_bondable(false) {
                         error!("Set bondable error: {:?}", e);
                     }
                     return Ok(conn);
@@ -845,6 +858,10 @@ fn advertising_mode(has_active_bond: bool) -> BleAdvertisingMode {
     } else {
         BleAdvertisingMode::Pairing
     }
+}
+
+fn bonded_reconnect_filter_policy() -> AdvFilterPolicy {
+    AdvFilterPolicy::FilterConn
 }
 
 fn pairing_window_timeout_secs(
@@ -1363,12 +1380,12 @@ mod tests {
     use rmk_types::battery::{BatteryStatus, ChargeState};
     use rmk_types::ble::{BleState, BleStatus};
     use trouble_host::Error;
-    use trouble_host::prelude::PhyKind;
+    use trouble_host::prelude::{AdvFilterPolicy, PhyKind};
 
     use super::{
-        HostPhyUpdateState, HostPowerTransition, Server, advertising_mode, directed_reconnect_should_continue,
-        host_phy_update_state, is_hci_link_update_busy, next_host_power_transition, pairing_window_timeout_secs,
-        seed_battery_level,
+        HostPhyUpdateState, HostPowerTransition, Server, advertising_mode, bonded_reconnect_filter_policy,
+        directed_reconnect_should_continue, host_phy_update_state, is_hci_link_update_busy, next_host_power_transition,
+        pairing_window_timeout_secs, seed_battery_level,
     };
     use crate::ble::sleep::wait_for_input_activity;
     use crate::config::BleHostPowerConfig;
@@ -1399,6 +1416,12 @@ mod tests {
     #[test]
     fn advertising_with_active_bond_uses_reconnecting_mode() {
         assert_eq!(advertising_mode(true), BleAdvertisingMode::Reconnecting);
+    }
+
+    #[test]
+    fn bonded_reconnect_is_undirected_but_connection_filtered() {
+        assert_eq!(bonded_reconnect_filter_policy(), AdvFilterPolicy::FilterConn);
+        assert_eq!(pairing_window_timeout_secs(true, 30, 10), None);
     }
 
     #[test]

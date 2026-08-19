@@ -1,11 +1,10 @@
+#[cfg(feature = "vial")]
+use rmk_types::action::{Action, KeyAction};
 use rmk_types::keycode::{HidKeyCode, from_ascii, to_ascii};
 
 use crate::MACRO_SPACE_SIZE;
 use crate::keymap::fill_vec;
 
-/// encoded with the two bytes, content at the third byte
-/// 0b 0000 0001 1000-1010 (VIAL_MACRO_EXT) are not supported
-///
 /// TODO save space: refactor to use 1 byte for encoding and convert to/from vial 2 byte encoding
 #[derive(Debug, Clone)]
 pub enum MacroOperation {
@@ -23,6 +22,15 @@ pub enum MacroOperation {
     Release(HidKeyCode),
     /// 0x01 04 + 2 byte for the delay in ms
     Delay(u16),
+    /// 0x01 05 + 2 byte Vial keycode
+    #[cfg(feature = "vial")]
+    ExtendedTap(Action),
+    /// 0x01 06 + 2 byte Vial keycode
+    #[cfg(feature = "vial")]
+    ExtendedPress(Action),
+    /// 0x01 07 + 2 byte Vial keycode
+    #[cfg(feature = "vial")]
+    ExtendedRelease(Action),
     /// Anything not covered above (and starting at
     /// 0x30 (= b'0'), is the 1 byte ascii character.
     Text(HidKeyCode, bool), // bool = shifted
@@ -75,8 +83,21 @@ impl MacroOperation {
                     (MacroOperation::End, offset + 4)
                 }
             }
-            (1, 5) | (1, 6) | (1, 7) => {
-                warn!("VIAL_MACRO_EXT is not supported");
+            (1, _extended_opcode @ 5..=7) => {
+                if idx + 3 < macro_sequences.len() {
+                    #[cfg(feature = "vial")]
+                    if let Some(action) = decode_vial_macro_action([macro_sequences[idx + 2], macro_sequences[idx + 3]])
+                    {
+                        let operation = match _extended_opcode {
+                            5 => MacroOperation::ExtendedTap(action),
+                            6 => MacroOperation::ExtendedPress(action),
+                            7 => MacroOperation::ExtendedRelease(action),
+                            _ => unreachable!(),
+                        };
+                        return (operation, offset + 4);
+                    }
+                }
+                warn!("Unsupported VIAL_MACRO_EXT action");
                 (MacroOperation::Delay(0), offset + 4)
             }
             _ => {
@@ -104,6 +125,35 @@ impl MacroOperation {
 
         if idx == macro_sequences.len() { None } else { Some(idx) }
     }
+}
+
+#[cfg(feature = "vial")]
+fn decode_vial_macro_action(wire: [u8; 2]) -> Option<Action> {
+    let mut keycode = u16::from_le_bytes(wire);
+    // Match Vial/QMK's escape for keycodes whose low byte is zero.
+    if keycode > 0xFF00 {
+        keycode = (keycode & 0x00FF) << 8;
+    }
+    match crate::host::via::keycode_convert::from_via_keycode(keycode) {
+        KeyAction::Single(Action::TriggerMacro(_)) => None,
+        KeyAction::Single(action) => Some(action),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "vial")]
+fn serialize_vial_macro_action(opcode: u8, action: Action) -> heapless::Vec<u8, 4> {
+    let keycode = crate::host::via::keycode_convert::to_via_keycode(KeyAction::Single(action));
+    let wire_keycode = if keycode & 0x00FF == 0 {
+        0xFF00 | (keycode >> 8)
+    } else {
+        keycode
+    };
+    let mut result = heapless::Vec::from_slice(&[0x01, opcode]).unwrap();
+    result
+        .extend_from_slice(&wire_keycode.to_le_bytes())
+        .expect("extended macro operation always fits");
+    result
 }
 
 /// serializes macro sequences
@@ -215,6 +265,12 @@ fn serialize(macro_operation: &MacroOperation) -> heapless::Vec<u8, 4> {
                 .expect("impossible error");
             result
         }
+        #[cfg(feature = "vial")]
+        MacroOperation::ExtendedTap(action) => serialize_vial_macro_action(0x05, *action),
+        #[cfg(feature = "vial")]
+        MacroOperation::ExtendedPress(action) => serialize_vial_macro_action(0x06, *action),
+        #[cfg(feature = "vial")]
+        MacroOperation::ExtendedRelease(action) => serialize_vial_macro_action(0x07, *action),
         MacroOperation::Text(key_code, shifted) => heapless::Vec::from_slice(&[to_ascii(*key_code, *shifted)]).unwrap(),
     }
 }
@@ -222,6 +278,8 @@ fn serialize(macro_operation: &MacroOperation) -> heapless::Vec<u8, 4> {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[cfg(feature = "vial")]
+    use rmk_types::action::Action;
 
     #[test]
     fn test_define_one_macro_sequence_manual() {
@@ -243,6 +301,51 @@ mod test {
             result_filled[i] = element
         }
         assert_eq!(macro_sequences_binary, result_filled);
+    }
+
+    #[cfg(feature = "vial")]
+    #[test]
+    fn vial_extended_layer_actions_decode_and_round_trip() {
+        let cases = [
+            (0x5223, Action::LayerOn(3)),
+            (0x5202, Action::LayerToggleOnly(2)),
+            (0x5264, Action::LayerToggle(4)),
+            (0x5241, Action::DefaultLayer(1)),
+            (0x52E5, Action::PersistentDefaultLayer(5)),
+        ];
+
+        for (keycode, expected) in cases {
+            let bytes = [0x01, 0x05, keycode as u8, (keycode >> 8) as u8, 0x00];
+            let (operation, next) = MacroOperation::get_next_macro_operation(&bytes, 0, 0);
+            assert_eq!(next, 4);
+            assert!(matches!(operation, MacroOperation::ExtendedTap(action) if action == expected));
+
+            let encoded = serialize(&MacroOperation::ExtendedTap(expected));
+            assert_eq!(encoded.as_slice(), &bytes[..4]);
+        }
+    }
+
+    #[cfg(feature = "vial")]
+    #[test]
+    fn vial_extended_zero_low_byte_escape_decodes() {
+        let bytes = [0x01, 0x05, 0x52, 0xFF, 0x00];
+        let (operation, next) = MacroOperation::get_next_macro_operation(&bytes, 0, 0);
+
+        assert_eq!(next, 4);
+        assert!(matches!(
+            operation,
+            MacroOperation::ExtendedTap(Action::LayerToggleOnly(0))
+        ));
+    }
+
+    #[cfg(feature = "vial")]
+    #[test]
+    fn vial_extended_nested_macro_is_rejected_safely() {
+        let bytes = [0x01, 0x05, 0x77, 0xFF, 0x00];
+        let (operation, next) = MacroOperation::get_next_macro_operation(&bytes, 0, 0);
+
+        assert_eq!(next, 4);
+        assert!(matches!(operation, MacroOperation::Delay(0)));
     }
     #[test]
     fn test_define_two_macro_sequence_manual() {

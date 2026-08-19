@@ -1399,6 +1399,15 @@ impl<'a> Keyboard<'a> {
         })
         .await;
 
+        if let Action::TriggerMacro(macro_idx) = action {
+            self.execute_macro(macro_idx, event).await;
+            return;
+        }
+
+        self.process_key_action_normal_non_macro(action, event).await;
+    }
+
+    async fn process_key_action_normal_non_macro(&mut self, action: Action, event: KeyboardEvent) {
         match action {
             Action::No => {}
             Action::Key(key) => match key {
@@ -1470,7 +1479,7 @@ impl<'a> Keyboard<'a> {
                 self.send_keyboard_report_with_resolved_modifiers(event.pressed).await;
                 self.update_osl(event);
             }
-            Action::TriggerMacro(macro_idx) => self.execute_macro(macro_idx, event).await,
+            Action::TriggerMacro(_) => warn!("Nested macros are not supported"),
             Action::KeyWithModifier(key_code, modifiers) => {
                 if event.pressed {
                     // These modifiers will be combined into the hid report, so
@@ -1534,6 +1543,16 @@ impl<'a> Keyboard<'a> {
             }
             _ => warn!("Action variant not supported: {:?}", action),
         }
+    }
+
+    #[cfg(feature = "vial")]
+    async fn process_vial_macro_action(&mut self, action: Action, event: KeyboardEvent) {
+        publish_event_async(ActionEvent {
+            action,
+            keyboard_event: event,
+        })
+        .await;
+        self.process_key_action_normal_non_macro(action, event).await;
     }
 
     /// Tap action, send a key when the key is pressed, then release the key.
@@ -1918,6 +1937,30 @@ impl<'a> Keyboard<'a> {
                     }
                     MacroOperation::Delay(t) => {
                         embassy_time::Timer::after_millis(t as u64).await;
+                    }
+                    #[cfg(feature = "vial")]
+                    MacroOperation::ExtendedPress(action) => {
+                        self.macro_texting = false;
+                        let mut action_event = event;
+                        action_event.pressed = true;
+                        self.process_vial_macro_action(action, action_event).await;
+                    }
+                    #[cfg(feature = "vial")]
+                    MacroOperation::ExtendedRelease(action) => {
+                        self.macro_texting = false;
+                        let mut action_event = event;
+                        action_event.pressed = false;
+                        self.process_vial_macro_action(action, action_event).await;
+                    }
+                    #[cfg(feature = "vial")]
+                    MacroOperation::ExtendedTap(action) => {
+                        self.macro_texting = false;
+                        let mut action_event = event;
+                        action_event.pressed = true;
+                        self.process_vial_macro_action(action, action_event).await;
+                        embassy_time::Timer::after_millis(2).await;
+                        action_event.pressed = false;
+                        self.process_vial_macro_action(action, action_event).await;
                     }
                     MacroOperation::End => {
                         if self.macro_texting {
@@ -2319,6 +2362,38 @@ mod test {
             // Release A key
             keyboard.process_inner(KeyboardEvent::key(0, 0, false)).await;
             assert_eq!(keyboard.held_keycodes[0], HidKeyCode::No);
+        };
+        block_on(main);
+    }
+
+    #[cfg(feature = "vial")]
+    #[test]
+    fn vial_extended_macros_execute_layer_actions() {
+        let main = async {
+            let mut keyboard = create_test_keyboard();
+            // Four Vial macro slots:
+            // M0 = press MO(1), M1 = release MO(1), M2 = tap TG(1), M3 = tap TO(1).
+            let macro_buffer = [
+                0x01, 0x06, 0x21, 0x52, 0x00, 0x01, 0x07, 0x21, 0x52, 0x00, 0x01, 0x05, 0x61, 0x52, 0x00, 0x01, 0x05,
+                0x01, 0x52, 0x00,
+            ];
+            keyboard.keymap.write_macro_buffer(0, &macro_buffer);
+            let released = KeyboardEvent::key(0, 0, false);
+
+            keyboard.execute_macro(0, released).await;
+            assert!(keyboard.keymap.is_layer_active(1));
+
+            keyboard.execute_macro(1, released).await;
+            assert!(!keyboard.keymap.is_layer_active(1));
+
+            keyboard.execute_macro(2, released).await;
+            assert!(keyboard.keymap.is_layer_active(1));
+            keyboard.execute_macro(2, released).await;
+            assert!(!keyboard.keymap.is_layer_active(1));
+
+            keyboard.execute_macro(3, released).await;
+            assert!(keyboard.keymap.is_layer_active(1));
+            assert_eq!(keyboard.keymap.active_layer(), 1);
         };
         block_on(main);
     }
