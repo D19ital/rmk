@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.8-rc.5
+
+### Improvements
+
+- Advertised firmware-native Repeat/Again support so Entropy can expose it independently from QMK Alt Repeat slots
+
+### Verification
+
+- Kept every production Ergohaven profile at 32 Morse / Tap Dance entries
+
 ## v0.1.8-rc.4
 
 ### Features

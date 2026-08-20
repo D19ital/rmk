@@ -44,6 +44,7 @@ const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_COMBO_OUTPUT: u16 = 0x0008;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_MORSE_ACTIONS: u16 = 0x0010;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_COMBO_LAYER: u16 = 0x0020;
 const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_VIAL_MACRO_EXT: u16 = 0x0040;
+const ERGOHAVEN_NATIVE_KEY_ACTION_CAP_REPEAT_KEY: u16 = 0x0080;
 const NATIVE_DYNAMIC_ACTION_KIND_COMBO_OUTPUT: u8 = 0x00;
 const NATIVE_DYNAMIC_ACTION_KIND_MORSE: u8 = 0x01;
 const NATIVE_KEY_ACTION_STATUS_OK: u8 = 0x00;
@@ -118,7 +119,8 @@ const fn native_key_action_capabilities() -> u16 {
         | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_COMBO_OUTPUT
         | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_MORSE_ACTIONS
         | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_COMBO_LAYER
-        | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_VIAL_MACRO_EXT;
+        | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_VIAL_MACRO_EXT
+        | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_REPEAT_KEY;
     #[cfg(feature = "universal_symbols")]
     let capabilities = capabilities
         | ERGOHAVEN_NATIVE_KEY_ACTION_CAP_UNIVERSAL_SYMBOLS
@@ -1036,6 +1038,10 @@ mod tests {
             );
             assert_ne!(
                 native_key_action_capabilities() & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_VIAL_MACRO_EXT,
+                0
+            );
+            assert_ne!(
+                native_key_action_capabilities() & ERGOHAVEN_NATIVE_KEY_ACTION_CAP_REPEAT_KEY,
                 0
             );
         });
