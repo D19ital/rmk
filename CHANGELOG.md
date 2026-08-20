@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.8-rc.1
+## v0.1.8-rc.4
 
 ### Features
 
@@ -10,6 +10,7 @@
 ### Fixes
 
 - Applied host disconnect timeout changes immediately and migrated existing v0.1.7 settings to the new 30-minute default
+- Kept wake-key press and release reports ordered while a sleeping bonded host reconnects, without blocking later keyboard input
 
 ## v0.1.7
 

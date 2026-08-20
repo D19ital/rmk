@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve ordered HID reports while a sleeping BLE host reconnects, without blocking the keyboard processor, and discard them if the wake attempt switches to another transport
 - Allow configured auto-mouse-layer entries to receive runtime enable/layer/timeout/threshold updates while retaining the generic runner's exact inactivity deadline
 - Keep BLE split keyboards with a 125 Hz pointing device on one fixed 7.5 ms cadence across every link, changing parameters only for deep sleep
 - Serialize BLE PHY/connection-parameter procedures with bounded collision retries so adding a split link cannot monopolize the executor

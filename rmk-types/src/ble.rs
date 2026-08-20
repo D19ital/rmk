@@ -17,7 +17,7 @@ pub enum BleState {
     /// The BLE is not in use (USB mode or sleep mode, default).
     Inactive,
     /// The host link was intentionally disconnected after an idle timeout.
-    /// Input wakes advertising, and the first report waits for reconnection.
+    /// Input wakes advertising, and reports queue until reconnection.
     Sleeping,
 }
 

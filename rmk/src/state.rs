@@ -75,6 +75,14 @@ pub(crate) fn update_status(f: impl FnOnce(&mut ConnectionStatus)) {
         crate::channel::clear_and_release_report_channel(prev_active);
     }
 
+    #[cfg(feature = "_ble")]
+    if prev.ble.state == BleState::Sleeping && new_active != Some(ConnectionType::Ble) {
+        // Reports accumulated for a sleeping bonded host must survive only the
+        // Sleeping -> Connected handoff. A profile/transport switch abandons
+        // that wake attempt and must not replay its keystrokes to another host.
+        crate::channel::BLE_REPORT_CHANNEL.clear();
+    }
+
     publish_event(ConnectionStatusChangeEvent(new));
 }
 
@@ -262,28 +270,47 @@ mod tests {
 
     #[cfg(feature = "_ble")]
     #[test]
-    fn first_report_waits_for_ble_sleep_reconnection() {
-        use embassy_futures::join::join;
-
+    fn wake_report_queues_without_blocking_keyboard_processing() {
         use crate::channel::{BLE_REPORT_CHANNEL, send_hid_report};
 
         let _guard = state_test_lock().lock().unwrap();
         reset_state();
         set_ble_state(BleState::Sleeping);
 
-        block_on(join(send_hid_report(pressed_keyboard_report()), async {
-            Timer::after(Duration::from_millis(1)).await;
-            assert!(BLE_REPORT_CHANNEL.try_receive().is_err());
-            set_ble_state(BleState::Connected);
-        }));
+        block_on(async {
+            send_hid_report(pressed_keyboard_report()).await;
+            send_hid_report(Report::KeyboardReport(KeyboardReport::default())).await;
+        });
 
         match BLE_REPORT_CHANNEL
             .try_receive()
-            .expect("the wake report should be queued after BLE reconnects")
+            .expect("the wake report should be retained before BLE reconnects")
         {
             Report::KeyboardReport(report) => assert_eq!(report.keycodes[0], 4),
             _ => panic!("expected keyboard wake report"),
         }
+        assert_all_up_keyboard_report(
+            BLE_REPORT_CHANNEL
+                .try_receive()
+                .expect("the wake key release should queue behind its press"),
+        );
+    }
+
+    #[cfg(all(not(feature = "_no_usb"), feature = "_ble"))]
+    #[test]
+    fn abandoning_sleep_for_usb_discards_pending_ble_reports() {
+        use crate::channel::{BLE_REPORT_CHANNEL, send_hid_report};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        set_preferred_connection(ConnectionType::Usb);
+        set_ble_state(BleState::Sleeping);
+        block_on(send_hid_report(pressed_keyboard_report()));
+        assert_eq!(BLE_REPORT_CHANNEL.len(), 1);
+
+        set_usb_state(UsbState::Configured);
+
+        assert!(BLE_REPORT_CHANNEL.try_receive().is_err());
     }
 
     #[cfg(not(feature = "_no_usb"))]

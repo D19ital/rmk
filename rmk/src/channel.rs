@@ -6,8 +6,6 @@ use embassy_sync::channel::{Channel, TrySendError};
 #[cfg(any(feature = "_ble", all(feature = "storage", feature = "host")))]
 use embassy_sync::signal::Signal;
 pub use embassy_sync::{blocking_mutex, channel, pubsub, zerocopy_channel};
-#[cfg(feature = "_ble")]
-use embassy_time::{Duration, Timer};
 use rmk_types::connection::ConnectionType;
 #[cfg(feature = "_ble")]
 use {
@@ -55,21 +53,23 @@ fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
     report_channel(transport).map(|ch| (transport, ch))
 }
 
-/// Reports generated while no transport is selected are normally dropped.
-/// During BLE idle sleep, the producer waits for reconnection so the input
-/// that woke the keyboard is not lost.
-pub async fn send_hid_report(mut report: Report) {
-    let (transport, ch) = loop {
-        if let Some(active) = active_report_channel() {
-            break active;
-        }
-
+fn report_destination() -> Option<(ConnectionType, &'static ReportChannel)> {
+    active_report_channel().or_else(|| {
         #[cfg(feature = "_ble")]
         if crate::state::current_ble_status().state == BleState::Sleeping {
-            Timer::after(Duration::from_millis(5)).await;
-            continue;
+            return Some((ConnectionType::Ble, &BLE_REPORT_CHANNEL));
         }
 
+        None
+    })
+}
+
+/// Reports generated while no transport is selected are normally dropped.
+/// During BLE idle sleep, reports are retained in the BLE queue. This lets the
+/// keyboard processor handle the wake key's release and subsequent input while
+/// the transport reconnects; the new BLE writer drains the ordered reports.
+pub async fn send_hid_report(mut report: Report) {
+    let Some((transport, ch)) = report_destination() else {
         return;
     };
 

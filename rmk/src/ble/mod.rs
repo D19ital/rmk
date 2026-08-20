@@ -358,7 +358,7 @@ where
                 };
 
                 // Sleeping remains set while wake advertising is in progress so
-                // the first HID report waits for the host to reconnect.
+                // HID reports stay in the BLE queue for the reconnecting host.
                 if !matches!(
                     crate::state::current_ble_status().state,
                     BleState::Advertising | BleState::Sleeping
