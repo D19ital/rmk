@@ -106,7 +106,7 @@ fn keymap_position_from_flat(index: usize) -> (u8, u8, u8) {
     let layer = index / layer_size;
     let layer_offset = index % layer_size;
     let row = layer_offset / crate::KEYMAP_COLS;
-    let col = layer_offset % crate::KEYMAP_COLS;
+    let col = layer_offset - row * crate::KEYMAP_COLS;
     (layer as u8, row as u8, col as u8)
 }
 

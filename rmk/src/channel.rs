@@ -54,14 +54,16 @@ fn active_report_channel() -> Option<(ConnectionType, &'static ReportChannel)> {
 }
 
 fn report_destination() -> Option<(ConnectionType, &'static ReportChannel)> {
-    active_report_channel().or_else(|| {
-        #[cfg(feature = "_ble")]
-        if crate::state::current_ble_status().state == BleState::Sleeping {
-            return Some((ConnectionType::Ble, &BLE_REPORT_CHANNEL));
-        }
+    if let Some(active) = active_report_channel() {
+        return Some(active);
+    }
 
-        None
-    })
+    #[cfg(feature = "_ble")]
+    if crate::state::current_ble_status().state == BleState::Sleeping {
+        return Some((ConnectionType::Ble, &BLE_REPORT_CHANNEL));
+    }
+
+    None
 }
 
 /// Reports generated while no transport is selected are normally dropped.
