@@ -9,8 +9,8 @@ use bitfield_struct::bitfield;
 use postcard::experimental::max_size::MaxSize;
 #[cfg(feature = "rmk_protocol")]
 use postcard_schema::{
-    schema::{DataModelType, NamedType},
     Schema,
+    schema::{DataModelType, NamedType},
 };
 use serde::{Deserialize, Serialize};
 

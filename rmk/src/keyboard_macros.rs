@@ -277,9 +277,10 @@ fn serialize(macro_operation: &MacroOperation) -> heapless::Vec<u8, 4> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     #[cfg(feature = "vial")]
     use rmk_types::action::Action;
+
+    use super::*;
 
     #[test]
     fn test_define_one_macro_sequence_manual() {

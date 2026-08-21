@@ -30,7 +30,7 @@ use crate::keymap::KeyMap;
 #[cfg(feature = "storage")]
 use crate::{
     channel::FLASH_CHANNEL,
-    storage::{queue_keymap_flash_write, FlashOperationMessage},
+    storage::{FlashOperationMessage, queue_keymap_flash_write},
 };
 
 /// Façade shared between Vial and rmk_protocol host services.
