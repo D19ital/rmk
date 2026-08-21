@@ -1,8 +1,10 @@
 //! General rotary encoder
 //!
 //! The rotary encoder implementation is adapted from: <https://github.com/leshow/rotary-encoder-hal/blob/master/src/lib.rs>
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU8, Ordering};
 
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::signal::Signal;
 use embedded_hal::digital::InputPin;
 #[cfg(feature = "async_matrix")]
@@ -16,7 +18,10 @@ use crate::event::KeyboardEvent;
 const MAX_DYNAMIC_ENCODERS: usize = 32;
 const MAX_ENCODER_STEPS: u8 = 8;
 static ENCODER_STEPS: [AtomicU8; MAX_DYNAMIC_ENCODERS] = [const { AtomicU8::new(1) }; MAX_DYNAMIC_ENCODERS];
-static ENABLED_ENCODERS: AtomicU32 = AtomicU32::new(u32::MAX);
+// ARMv6-M does not provide atomic read-modify-write operations for `u32`.
+// Keep the shared bitset behind RMK's blocking mutex so every supported
+// target can update it without polling disabled encoder tasks.
+static ENABLED_ENCODERS: BlockingMutex<crate::RawMutex, Cell<u32>> = BlockingMutex::new(Cell::new(u32::MAX));
 static ENCODER_ENABLED_CHANGED: [Signal<crate::RawMutex, ()>; MAX_DYNAMIC_ENCODERS] =
     [const { Signal::new() }; MAX_DYNAMIC_ENCODERS];
 
@@ -49,11 +54,12 @@ pub fn set_encoder_enabled(id: u8, enabled: bool) -> bool {
         return false;
     };
     let bit = 1u32 << u32::from(id);
-    let previous = if enabled {
-        ENABLED_ENCODERS.fetch_or(bit, Ordering::AcqRel) & bit != 0
-    } else {
-        ENABLED_ENCODERS.fetch_and(!bit, Ordering::AcqRel) & bit != 0
-    };
+    let previous = ENABLED_ENCODERS.lock(|state| {
+        let current = state.get();
+        let previous = current & bit != 0;
+        state.set(if enabled { current | bit } else { current & !bit });
+        previous
+    });
     if previous != enabled {
         changed.signal(());
     }
@@ -65,7 +71,8 @@ pub fn encoder_enabled(id: u8) -> bool {
     if usize::from(id) >= MAX_DYNAMIC_ENCODERS {
         return true;
     }
-    ENABLED_ENCODERS.load(Ordering::Acquire) & (1u32 << u32::from(id)) != 0
+    let bit = 1u32 << u32::from(id);
+    ENABLED_ENCODERS.lock(|state| state.get() & bit != 0)
 }
 
 /// Holds current/old state and both [`InputPin`](https://docs.rs/embedded-hal/latest/embedded_hal/digital/trait.InputPin.html)

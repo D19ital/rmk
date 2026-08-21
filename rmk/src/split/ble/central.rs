@@ -38,8 +38,16 @@ static PERIPHERAL_CONNECTION_CHANGED: Signal<crate::RawMutex, ()> = Signal::new(
 static SPLIT_WINDOW_RESTART: Signal<crate::RawMutex, u32> = Signal::new();
 static SPLIT_WINDOW_DONE: Signal<crate::RawMutex, u32> = Signal::new();
 static SPLIT_WINDOW_GENERATION: BlockingMutex<crate::RawMutex, Cell<u32>> = BlockingMutex::new(Cell::new(0));
-static CONFIGURED_LINK_PROFILES: AtomicU32 = AtomicU32::new(0);
-static POINTING_LINK_PROFILES: AtomicU32 = AtomicU32::new(0);
+#[derive(Clone, Copy)]
+struct LinkProfileOverrides {
+    configured: u32,
+    pointing: u32,
+}
+static LINK_PROFILE_OVERRIDES: BlockingMutex<crate::RawMutex, Cell<LinkProfileOverrides>> =
+    BlockingMutex::new(Cell::new(LinkProfileOverrides {
+        configured: 0,
+        pointing: 0,
+    }));
 static LINK_PROFILE_CHANGED: [Signal<crate::RawMutex, ()>; u32::BITS as usize] =
     [const { Signal::new() }; u32::BITS as usize];
 
@@ -73,11 +81,18 @@ pub fn set_split_link_profile(peripheral_id: usize, profile: SplitLinkProfile) -
         return false;
     };
     let bit = bit_for_peri(peripheral_id);
-    let was_configured = CONFIGURED_LINK_PROFILES.fetch_or(bit, Ordering::AcqRel) & bit != 0;
-    let previous_pointing = match profile {
-        SplitLinkProfile::Keyboard => POINTING_LINK_PROFILES.fetch_and(!bit, Ordering::AcqRel) & bit != 0,
-        SplitLinkProfile::Pointing => POINTING_LINK_PROFILES.fetch_or(bit, Ordering::AcqRel) & bit != 0,
-    };
+    let (was_configured, previous_pointing) = LINK_PROFILE_OVERRIDES.lock(|state| {
+        let current = state.get();
+        let pointing = match profile {
+            SplitLinkProfile::Keyboard => current.pointing & !bit,
+            SplitLinkProfile::Pointing => current.pointing | bit,
+        };
+        state.set(LinkProfileOverrides {
+            configured: current.configured | bit,
+            pointing,
+        });
+        (current.configured & bit != 0, current.pointing & bit != 0)
+    });
     let is_pointing = profile == SplitLinkProfile::Pointing;
     if !was_configured || previous_pointing != is_pointing {
         changed.signal(());
@@ -87,14 +102,16 @@ pub fn set_split_link_profile(peripheral_id: usize, profile: SplitLinkProfile) -
 
 fn effective_split_link_profile(peripheral_id: usize, generated: SplitLinkProfile) -> SplitLinkProfile {
     let bit = bit_for_peri(peripheral_id);
-    if CONFIGURED_LINK_PROFILES.load(Ordering::Acquire) & bit == 0 {
-        return generated;
-    }
-    if POINTING_LINK_PROFILES.load(Ordering::Acquire) & bit != 0 {
-        SplitLinkProfile::Pointing
-    } else {
-        SplitLinkProfile::Keyboard
-    }
+    LINK_PROFILE_OVERRIDES.lock(|state| {
+        let state = state.get();
+        if state.configured & bit == 0 {
+            generated
+        } else if state.pointing & bit != 0 {
+            SplitLinkProfile::Pointing
+        } else {
+            SplitLinkProfile::Keyboard
+        }
+    })
 }
 
 fn required_peripheral_mask() -> u32 {
