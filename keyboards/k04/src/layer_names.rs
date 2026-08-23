@@ -2,7 +2,7 @@ use core::str;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use rmk::config::{BleHostPowerConfig, VialDeviceSettings, VialDeviceSettingsData};
-use rmk::event::{PeripheralSettingsEvent, PeripheralSettingsRefreshEvent, publish_event};
+use rmk::event::{publish_event, PeripheralSettingsEvent, PeripheralSettingsRefreshEvent};
 use rmk::macros::processor;
 
 pub const LAYER_NAME_COUNT: usize = 16;
@@ -20,11 +20,11 @@ const LEGACY_LAYER_NAMES_STORAGE_OFFSET: usize = MODULE_STORAGE_OFFSET + LEGACY_
 
 pub type LayerNameString = heapless::String<LAYER_NAME_MAX>;
 
-const SETTING_KEYS: [u16; 83] = [
+const SETTING_KEYS: [u16; 82] = [
     120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142,
     143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212,
     213, 214, 215, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319,
-    320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+    320, 321, 322, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
 ];
 
 const MODULE_SETTINGS_VERSION: u8 = 9;
@@ -32,18 +32,6 @@ const MODULE_SETTINGS_LEN: usize = 45;
 const LEGACY_MODULE_SETTINGS_STORAGE_LEN: usize = 32;
 const MODULE_SETTINGS_STORAGE_LEN: usize = 33;
 const MODULE_SETTINGS_SYNC_LEN: usize = 27;
-const HOST_DISCONNECT_TIMEOUT_SECONDS_TABLE: [u64; 10] = [
-    10 * 60,
-    15 * 60,
-    20 * 60,
-    30 * 60,
-    45 * 60,
-    60 * 60,
-    2 * 60 * 60,
-    3 * 60 * 60,
-    4 * 60 * 60,
-    5 * 60 * 60,
-];
 const IDX_VERSION: usize = 0;
 const IDX_LEFT_MODE: usize = 1;
 const IDX_RIGHT_MODE: usize = 2;
@@ -68,7 +56,9 @@ const IDX_LED_BRIGHTNESS: usize = 20;
 const IDX_LED_TIMEOUT_SEC: usize = 21;
 const IDX_LAYER_COLORS_PACKED: usize = 22;
 const IDX_BT_PROFILE_COLORS: usize = 32;
-const IDX_HOST_DISCONNECT_TIMEOUT: usize = 37;
+// Preserve byte 37 so the v9 storage layout does not shift. Firmware no
+// longer advertises or consumes this former host-timeout setting.
+const IDX_RESERVED_HOST_DISCONNECT_TIMEOUT: usize = 37;
 const IDX_AUTO_LAYER_TIMEOUT: usize = 38;
 const IDX_MODULE_SELECT: usize = 39;
 const IDX_LEFT_ENCODER_INTERVAL: usize = 40;
@@ -118,7 +108,8 @@ const MODULE_DEFAULTS: [u8; MODULE_SETTINGS_LEN] = {
     data[IDX_AUTO_FLAGS] = DEFAULT_AUTO_FLAGS;
     data[IDX_LED_BRIGHTNESS] = 8;
     data[IDX_LED_TIMEOUT_SEC] = 1;
-    data[IDX_HOST_DISCONNECT_TIMEOUT] = 3;
+    // Keep the former 30-minute index for downgrade compatibility.
+    data[IDX_RESERVED_HOST_DISCONNECT_TIMEOUT] = 3;
     data[IDX_AUTO_LAYER_TIMEOUT] = 1;
     data[IDX_LEFT_ENCODER_INTERVAL] = 4;
     data[IDX_RIGHT_ENCODER_INTERVAL] = 4;
@@ -173,8 +164,8 @@ pub fn ble_host_power_config() -> BleHostPowerConfig {
     )
 }
 
-pub fn host_disconnect_timeout_seconds() -> u64 {
-    HOST_DISCONNECT_TIMEOUT_SECONDS_TABLE[usize::from(module_host_disconnect_timeout_index())]
+fn host_disconnect_timeout_seconds() -> u64 {
+    30 * 60
 }
 
 pub fn version() -> u8 {
@@ -282,10 +273,10 @@ fn deserialize(bytes: &[u8]) {
             }
             _ => None,
         };
-        if let Some((layer_names_offset, migrate_placeholders, reset_host_timeout)) = profile {
+        if let Some((layer_names_offset, migrate_placeholders, reset_reserved_timeout)) = profile {
             deserialize_module_settings(&bytes[MODULE_STORAGE_OFFSET..layer_names_offset]);
-            if reset_host_timeout {
-                module_set_byte(IDX_HOST_DISCONNECT_TIMEOUT, 3);
+            if reset_reserved_timeout {
+                module_set_byte(IDX_RESERVED_HOST_DISCONNECT_TIMEOUT, 3);
             }
             deserialize_compact_layer_names(&bytes[layer_names_offset..]);
             if migrate_placeholders {
@@ -448,10 +439,6 @@ fn module_set_setting(qsid: u16, data: &[u8]) -> bool {
         316 => module_set_byte(IDX_LED_BRIGHTNESS, value),
         317 => module_set_byte(IDX_LED_TIMEOUT_SEC, value),
         318..=322 => module_set_bt_profile_color_index((qsid - 318) as u8, value.min(24)),
-        323 => {
-            module_set_byte(IDX_HOST_DISCONNECT_TIMEOUT, value.min(9));
-            rmk::ble::notify_host_power_config_changed();
-        }
         324 => module_set_byte(IDX_AUTO_LAYER_TIMEOUT, value.min(5)),
         325 => module_set_byte(IDX_LEFT_ENCODER_INTERVAL, value.min(9)),
         326 => module_set_byte(IDX_RIGHT_ENCODER_INTERVAL, value.min(9)),
@@ -587,7 +574,6 @@ fn module_qsid_value(qsid: u16) -> Option<u8> {
         316 => module_byte(IDX_LED_BRIGHTNESS),
         317 => module_byte(IDX_LED_TIMEOUT_SEC),
         318..=322 => module_bt_profile_color_index((qsid - 318) as u8),
-        323 => module_host_disconnect_timeout_index(),
         324 => module_byte(IDX_AUTO_LAYER_TIMEOUT).min(5),
         325 => module_byte(IDX_LEFT_ENCODER_INTERVAL).min(9),
         326 => module_byte(IDX_RIGHT_ENCODER_INTERVAL).min(9),
@@ -635,7 +621,7 @@ fn serialize_module_settings() -> [u8; MODULE_SETTINGS_STORAGE_LEN] {
         pack_color(&mut data, 15, i, module_bt_profile_color_index(i - 16));
         i += 1;
     }
-    data[29] = (module_byte(IDX_HOST_DISCONNECT_TIMEOUT).min(9) & 0x0f)
+    data[29] = (module_byte(IDX_RESERVED_HOST_DISCONNECT_TIMEOUT) & 0x0f)
         | ((module_byte(IDX_LEFT_ENCODER_INTERVAL).min(9) & 0x0f) << 4);
     data[30] =
         module_byte(IDX_AUTO_LAYER_TIMEOUT).min(5) | ((module_byte(IDX_RIGHT_ENCODER_INTERVAL).min(9) & 0x0f) << 4);
@@ -687,7 +673,7 @@ fn deserialize_module_settings(data: &[u8]) {
         module_set_bt_profile_color_index(i - 16, unpack_color(data, 15, i).min(24));
         i += 1;
     }
-    MODULE_SETTINGS[IDX_HOST_DISCONNECT_TIMEOUT].store((data[29] & 0x0f).min(9), Ordering::Relaxed);
+    MODULE_SETTINGS[IDX_RESERVED_HOST_DISCONNECT_TIMEOUT].store(data[29] & 0x0f, Ordering::Relaxed);
     MODULE_SETTINGS[IDX_LEFT_ENCODER_INTERVAL].store((data[29] >> 4).min(9), Ordering::Relaxed);
     MODULE_SETTINGS[IDX_AUTO_LAYER_TIMEOUT].store((data[30] & 0x0f).min(5), Ordering::Relaxed);
     MODULE_SETTINGS[IDX_RIGHT_ENCODER_INTERVAL].store((data[30] >> 4).min(9), Ordering::Relaxed);
@@ -796,10 +782,6 @@ fn module_set_module_selection(side: u8, value: u8) {
     let mut select = module_byte(IDX_MODULE_SELECT) & !(0x03 << shift);
     select |= (value.min(MODULE_SELECT_TOUCH) & 0x03) << shift;
     module_set_byte(IDX_MODULE_SELECT, select & 0x0f);
-}
-
-fn module_host_disconnect_timeout_index() -> u8 {
-    module_byte(IDX_HOST_DISCONNECT_TIMEOUT).min((HOST_DISCONNECT_TIMEOUT_SECONDS_TABLE.len() - 1) as u8)
 }
 
 fn module_layer_color_index(layer: u8) -> u8 {

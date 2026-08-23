@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Increase Trouble packet and event queues for split BLE builds, leaving single-link targets at their existing memory footprint
 - **BREAKING**: the Rust `Fork` API replaces `kept_modifiers` with its inverse, `suppressed_modifiers`, and adds `layers` plus Vial-compatible `options`; `keyboard.toml` keeps the existing `kept_modifiers` field and behavior
 - **BREAKING**: `CompositeReportType` discriminants are renumbered (`Keyboard=1`, `Mouse=2`, `Media=3`, `System=4`): the BLE report map carries the keyboard report as id 1, and the mouse/media/system report ids shift to 2/3/4 on both BLE and USB. USB hosts re-read report ids on every enumeration so nothing changes for them; BLE hosts bonded to an older firmware must forget and re-pair the keyboard
 - **BREAKING**: `PollingController::INTERVAL` constant is now `PollingController::interval()` method, allowing dynamic interval configuration at runtime
@@ -28,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep bonded BLE wake sessions alive through encryption, preserve negotiated link parameters on host-power-managed reconnects, and recover from stalled HID notifications without leaving a key held
+- Prevent split scanning and reconnect work from starving an established host link, retaining validated peers across transient failures while recovering stale peers after repeated failures
 - Preserve ordered HID reports while a sleeping BLE host reconnects, without blocking the keyboard processor, and discard them if the wake attempt switches to another transport
 - Allow configured auto-mouse-layer entries to receive runtime enable/layer/timeout/threshold updates while retaining the generic runner's exact inactivity deadline
 - Keep BLE split keyboards with a 125 Hz pointing device on one fixed 7.5 ms cadence across every link, changing parameters only for deep sleep

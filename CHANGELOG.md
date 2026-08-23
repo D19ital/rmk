@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Fixed standalone K:04 host disconnect at 30 minutes and removed the stale hidden timeout setting from firmware and Vial definitions
+
+### Fixes
+
+- Hardened bonded BLE wake through encryption, fast reconnect, local HID suspend, safe split-radio scheduling, stale-peer recovery, and fail-closed recovery from stalled HID notifications
+- Released temporary wake-input observers immediately after reconnect so their queues cannot block a key release and leave the last key repeating
+
 ## v0.1.8-rc.5
 
 ### Improvements

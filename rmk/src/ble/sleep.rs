@@ -93,8 +93,13 @@ pub(crate) fn take_host_power_input() -> Option<bool> {
 }
 
 /// Request sleep immediately instead of waiting for the idle timeout.
-pub(crate) fn request_sleep() {
+pub(crate) fn request_local_sleep() {
     SLEEP_INPUT.signal(true);
+}
+
+/// Request keyboard sleep and terminate the connected host session.
+pub(crate) fn request_sleep() {
+    request_local_sleep();
     HOST_POWER_INPUT.signal(true);
 }
 
@@ -191,5 +196,27 @@ mod tests {
             Timer::after_millis(10).await;
             assert!(!is_sleeping());
         });
+    }
+
+    #[test]
+    fn local_sleep_request_keeps_the_host_session_alive() {
+        SLEEP_INPUT.reset();
+        HOST_POWER_INPUT.reset();
+
+        request_local_sleep();
+
+        assert_eq!(SLEEP_INPUT.try_take(), Some(true));
+        assert_eq!(take_host_power_input(), None);
+    }
+
+    #[test]
+    fn full_sleep_request_notifies_both_managers() {
+        SLEEP_INPUT.reset();
+        HOST_POWER_INPUT.reset();
+
+        request_sleep();
+
+        assert_eq!(SLEEP_INPUT.try_take(), Some(true));
+        assert_eq!(take_host_power_input(), Some(true));
     }
 }

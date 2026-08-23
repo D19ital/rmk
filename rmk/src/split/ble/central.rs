@@ -12,7 +12,7 @@ use heapless::VecView;
 use trouble_host::prelude::*;
 
 use crate::SPLIT_PAIRING_TIMEOUT_SECONDS;
-use crate::ble::sleep::{report_activity, report_pointing_activity};
+use crate::ble::sleep::{is_sleeping, report_activity, report_pointing_activity};
 use crate::ble::{update_ble_phy, update_conn_params};
 use crate::channel::FLASH_CHANNEL;
 use crate::event::{
@@ -59,6 +59,60 @@ const POINTING_ACTIVITY_THRESHOLD: u16 = 2;
 
 const SPLIT_SERVICE_UUID: [u8; 16] = [70, 153, 101, 152, 54, 53, 10, 191, 7, 75, 229, 24, 170, 251, 213, 77];
 const SPLIT_COMPANY_ID: u16 = 0xe118;
+const VALIDATED_PEER_FAILURE_LIMIT: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedPeerAction {
+    Retain { consecutive_failures: u8 },
+    Forget,
+}
+
+#[derive(Default)]
+struct PeerRetryState {
+    validated_failures: u8,
+}
+
+impl PeerRetryState {
+    fn on_failed_attempt(&mut self, uncommitted: bool) -> FailedPeerAction {
+        if uncommitted {
+            self.validated_failures = 0;
+            return FailedPeerAction::Forget;
+        }
+
+        self.validated_failures = self.validated_failures.saturating_add(1);
+        if self.validated_failures >= VALIDATED_PEER_FAILURE_LIMIT {
+            self.validated_failures = 0;
+            FailedPeerAction::Forget
+        } else {
+            FailedPeerAction::Retain {
+                consecutive_failures: self.validated_failures,
+            }
+        }
+    }
+
+    fn on_validated(&mut self) {
+        self.validated_failures = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SplitScanTiming {
+    interval: Duration,
+    window: Duration,
+}
+
+fn split_scan_timing() -> SplitScanTiming {
+    // A continuous split scan can starve an already-connected host link on a
+    // single radio. Leave 70% of each cycle to established link traffic.
+    SplitScanTiming {
+        interval: Duration::from_millis(100),
+        window: Duration::from_millis(30),
+    }
+}
+
+fn split_liveness_poll() -> Duration {
+    Duration::from_millis(250)
+}
 
 /// Active connection cadence for a generated split keyboard.
 ///
@@ -316,8 +370,11 @@ pub async fn scan_peripherals<
                     let mut central = stack.central();
                     wait_for_stack_started().await;
                     let mut scanner = Scanner::new(&mut central);
+                    let timing = split_scan_timing();
                     let scan_config = ScanConfig {
                         active: false,
+                        interval: timing.interval,
+                        window: timing.window,
                         ..Default::default()
                     };
                     let _guard = SCANNING_MUTEX.lock().await;
@@ -454,16 +511,31 @@ fn take_uncommitted_peer_candidate(peri_id: usize) -> bool {
     })
 }
 
-async fn forget_failed_peer(peri_id: usize, addrs: &RefCell<VecView<Option<[u8; 6]>>>) {
-    take_uncommitted_peer_candidate(peri_id);
+async fn handle_failed_peer(
+    peri_id: usize,
+    addrs: &RefCell<VecView<Option<[u8; 6]>>>,
+    retry_state: &mut PeerRetryState,
+) {
+    let uncommitted = take_uncommitted_peer_candidate(peri_id);
+    match retry_state.on_failed_attempt(uncommitted) {
+        FailedPeerAction::Retain { consecutive_failures } => {
+            warn!(
+                "Retaining validated split peer {} after transient connection failure {}/{}",
+                peri_id, consecutive_failures, VALIDATED_PEER_FAILURE_LIMIT
+            );
+            return;
+        }
+        FailedPeerAction::Forget => {}
+    }
+
     if let Some(addr) = addrs.borrow_mut().get_mut(peri_id) {
         *addr = None;
     }
 
-    // A stored address can belong to an older Qube/half pairing. Keeping it
-    // after an initiating failure prevents the central from ever scanning for
-    // the currently powered peripheral. Invalidate only after the connection
-    // attempt itself fails; normal disconnects retain the proven address.
+    // An address learned by the current scan is not trusted until product
+    // validation succeeds, so forget it immediately. A previously validated
+    // peer gets a bounded retry window before it is cleared, allowing both
+    // transient recovery and eventual replacement/re-pairing.
     #[cfg(feature = "storage")]
     FLASH_CHANNEL
         .send(FlashOperationMessage::PeerAddress(PeerAddress::new(
@@ -507,6 +579,7 @@ pub(crate) async fn run_ble_peripheral_manager<
     profile: SplitLinkProfile,
 ) {
     trace!("SPLIT_MESSAGE_MAX_SIZE: {}", SPLIT_MESSAGE_MAX_SIZE);
+    let mut peer_retry_state = PeerRetryState::default();
 
     loop {
         // Check until the address is available
@@ -524,14 +597,14 @@ pub(crate) async fn run_ble_peripheral_manager<
 
         let mut central = stack.central();
         let active_profile = effective_split_link_profile(peri_id, profile);
+        let timing = split_scan_timing();
         let config = ConnectConfig {
             connect_params: active_central_conn_param(active_profile),
             scan_config: ScanConfig {
                 filter_accept_list: &[address],
-                // Match the effective 62.5 ms initiating scan used by the
-                // last working bt-hci 0.6 firmware.
-                interval: Duration::from_micros(62_500),
-                window: Duration::from_micros(62_500),
+                active: false,
+                interval: timing.interval,
+                window: timing.window,
                 ..Default::default()
             },
         };
@@ -573,24 +646,23 @@ pub(crate) async fn run_ble_peripheral_manager<
                     let e = defmt::Debug2Format(&e);
                     error!("BLE central error: {:?}", e);
                 }
-                if !peer_validated.get() {
+                publish_peripheral_connection(peri_id, false);
+                if peer_validated.get() {
+                    peer_retry_state.on_validated();
+                } else {
                     warn!("Split peripheral {} disconnected before validation", peri_id);
-                    // A successful HCI connection can still fail during GATT
-                    // discovery or product validation. Treat that exactly like
-                    // an initiating failure so a stale saved address cannot
-                    // trap Qube in an endless reconnect loop.
-                    forget_failed_peer(peri_id, addrs).await;
+                    handle_failed_peer(peri_id, addrs, &mut peer_retry_state).await;
                 }
             }
             Ok(Err(e)) => {
                 #[cfg(feature = "defmt")]
                 let e = defmt::Debug2Format(&e);
                 error!("Connect to peripheral {} error: {:?}", peri_id, e);
-                forget_failed_peer(peri_id, addrs).await;
+                handle_failed_peer(peri_id, addrs, &mut peer_retry_state).await;
             }
             Err(_) => {
                 warn!("Connect to peripheral {} timeout", peri_id);
-                forget_failed_peer(peri_id, addrs).await;
+                handle_failed_peer(peri_id, addrs, &mut peer_retry_state).await;
             }
         }
         // Reconnect after 500ms
@@ -683,7 +755,7 @@ async fn run_central_manager_task<
 ) -> Result<(), BleHostError<C::Error>> {
     let client = GattClient::<C, P, 10>::new(stack, conn).await?;
 
-    // Use 2M Phy
+    // Use 2M Phy.
     update_ble_phy(stack, conn).await;
 
     info!("Updating connection parameters for peripheral");
@@ -710,7 +782,7 @@ async fn ble_central_task<'a, C: Controller + ControllerCmdAsync<LeSetPhy>, P: P
     // Simply monitor connection status
     let conn_check = async {
         while conn.is_connected() {
-            Timer::after_secs(5).await;
+            Timer::after(split_liveness_poll()).await;
         }
     };
 
@@ -885,12 +957,14 @@ async fn follow_sleep_state<
     let mut sleep_events = SleepStateEvent::subscriber();
     let profile_changed = LINK_PROFILE_CHANGED.get(peripheral_id);
 
-    // A new link needs the active cadence for discovery and traffic. Reporting
-    // activity also wakes every other split link through the global manager.
-    report_activity();
-
-    // `run_central_manager_task` just requested the active parameters.
-    let mut applied_sleeping = false;
+    // A new link must follow the already-latched keyboard state. Treating link
+    // creation as user input can wake the host and every other split link.
+    let mut applied_sleeping = if is_sleeping() {
+        info!("New split link inherits sleep mode");
+        update_conn_params(stack, conn, &sleeping_central_conn_param()).await
+    } else {
+        false
+    };
     let mut applied_profile = effective_split_link_profile(peripheral_id, generated_profile);
     loop {
         let update = if let Some(profile_changed) = profile_changed {
@@ -969,6 +1043,70 @@ pub fn pointing_quiet_period_remaining(quiet_period: Duration) -> Duration {
 #[cfg(test)]
 mod advertisement_tests {
     use super::*;
+
+    #[test]
+    fn uncommitted_peer_is_forgotten_after_first_failure() {
+        let mut retry = PeerRetryState::default();
+
+        assert_eq!(retry.on_failed_attempt(true), FailedPeerAction::Forget);
+    }
+
+    #[test]
+    fn validated_peer_is_retried_twice_then_forgotten() {
+        let mut retry = PeerRetryState::default();
+
+        assert_eq!(
+            retry.on_failed_attempt(false),
+            FailedPeerAction::Retain {
+                consecutive_failures: 1
+            }
+        );
+        assert_eq!(
+            retry.on_failed_attempt(false),
+            FailedPeerAction::Retain {
+                consecutive_failures: 2
+            }
+        );
+        assert_eq!(retry.on_failed_attempt(false), FailedPeerAction::Forget);
+    }
+
+    #[test]
+    fn successful_validation_resets_peer_failure_count() {
+        let mut retry = PeerRetryState::default();
+        assert!(matches!(
+            retry.on_failed_attempt(false),
+            FailedPeerAction::Retain {
+                consecutive_failures: 1
+            }
+        ));
+        assert!(matches!(
+            retry.on_failed_attempt(false),
+            FailedPeerAction::Retain {
+                consecutive_failures: 2
+            }
+        ));
+
+        retry.on_validated();
+
+        assert_eq!(
+            retry.on_failed_attempt(false),
+            FailedPeerAction::Retain {
+                consecutive_failures: 1
+            }
+        );
+    }
+
+    #[test]
+    fn split_scan_leaves_radio_time_for_established_links() {
+        assert_eq!(
+            split_scan_timing(),
+            SplitScanTiming {
+                interval: Duration::from_millis(100),
+                window: Duration::from_millis(30),
+            }
+        );
+        assert_eq!(split_liveness_poll(), Duration::from_millis(250));
+    }
 
     fn current_advertisement(product_id: u16, peripheral_id: u8) -> [u8; 28] {
         let mut data = [0u8; 28];

@@ -1,7 +1,7 @@
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeReadPhy, LeSetPhy};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::join::join3;
-use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
@@ -21,8 +21,8 @@ use crate::ble::led::BleLedReader;
 use crate::ble::passkey::{PasskeyInputState, next_gatt_event};
 use crate::ble::profile::{ProfileInfo, ProfileManager, UPDATED_CCCD_TABLE, UPDATED_PROFILE};
 use crate::ble::sleep::{
-    InputActivityWaiter, report_activity, request_sleep, reset_host_power_input, take_host_power_input,
-    wait_for_host_power_input,
+    InputActivityWaiter, report_activity, request_local_sleep, request_sleep, reset_host_power_input,
+    take_host_power_input, wait_for_host_power_input,
 };
 use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL};
 use crate::config::{BleBatteryConfig, BleHostPowerConfig, RmkConfig};
@@ -48,9 +48,12 @@ pub(crate) const CONNECTIONS_MAX: usize = crate::SPLIT_PERIPHERALS_NUM + 1;
 pub(crate) const L2CAP_CHANNELS_MAX: usize = CONNECTIONS_MAX * 4; // Signal + att + smp + hid
 
 const DIRECTED_RECONNECT_WINDOW_MS: u64 = 1_300;
+const FAST_BONDED_RECONNECT_TOTAL_MS: u64 = 5_000;
 const FAST_ADVERTISING_TIMEOUT_SECS: u64 = 30;
 const HOST_PHY_UPDATE_ATTEMPTS: u8 = 3;
 const HOST_PHY_UPDATE_SETTLE_MS: u64 = 80;
+const HOST_CONNECTION_LIVENESS_POLL_MS: u64 = 250;
+const HID_WRITE_TIMEOUT_SECS: u64 = 2;
 const HOST_IDLE_MAX_LATENCY: u16 = 30;
 const HOST_INTERACTIVE_MAX_LATENCY: u16 = 0;
 const VIAL_LINK_IDLE_TIMEOUT_SECS: u64 = 30;
@@ -66,7 +69,7 @@ static BLE_HCI_LINK_UPDATE_MUTEX: Mutex<crate::RawMutex, ()> = Mutex::new(());
 #[cfg(feature = "host")]
 static VIAL_BLE_ACTIVITY: Signal<crate::RawMutex, ()> = Signal::new();
 
-/// Wakes the connected host-power task when a runtime timeout setting changes.
+/// Wakes the connected host-power task when a runtime policy changes.
 static HOST_POWER_CONFIG_CHANGED: Signal<crate::RawMutex, ()> = Signal::new();
 
 /// Notify the BLE transport that its runtime host-power policy changed.
@@ -225,13 +228,18 @@ where
                 let active_bond_info = profile_manager.active_bond_info();
                 #[cfg(feature = "storage")]
                 let active_peer = active_bond_info.as_ref().map(|info| info.info.identity.addr);
+                #[cfg(feature = "storage")]
+                let host_link_policy =
+                    host_link_startup_policy(active_bond_info.is_some(), host_power_config.is_some());
                 #[cfg(not(feature = "storage"))]
                 let active_peer = None;
+                #[cfg(not(feature = "storage"))]
+                let host_link_policy = host_link_startup_policy(false, host_power_config.is_some());
 
                 // During wake advertising, subscribe before opening the radio
                 // window so a second input can request another attempt even if
                 // the current reconnect window expires.
-                let wake_during_advertising = resuming_from_sleep.then(InputActivityWaiter::new);
+                let wake_during_advertising = WakeAdvertisingInput::new(resuming_from_sleep);
 
                 match select(
                     advertise(product_name, &mut peripheral, server, active_peer, resuming_from_sleep),
@@ -240,6 +248,11 @@ where
                 .await
                 {
                     Either::First(Ok(conn)) => {
+                        // The wake observer is needed only until advertising
+                        // succeeds. Drop both of its PubSub subscribers before
+                        // entering a connection that can live for hours.
+                        wake_during_advertising.connected();
+
                         // Do NOT emit BleState::Connected here. gatt_events_task emits
                         // Connected when it sees GattConnectionEvent::Encrypted.
                         let connection_was_resume = resuming_from_sleep;
@@ -252,6 +265,7 @@ where
                                 active_bond_info,
                                 &self.config,
                                 host_power_config,
+                                host_link_policy,
                             ),
                             profile_manager.update_profile(),
                         )
@@ -272,12 +286,7 @@ where
                                 let activity_during_transition = take_host_power_input() == Some(false);
 
                                 if conn.raw().is_connected() {
-                                    conn.raw().disconnect();
-                                    loop {
-                                        if let GattConnectionEvent::Disconnected { .. } = conn.next().await {
-                                            break;
-                                        }
-                                    }
+                                    disconnect_and_wait(&conn).await;
                                 }
 
                                 if activity_during_transition {
@@ -296,6 +305,22 @@ where
                                     }
                                 }
                             }
+                            Either::First(BleKeyboardExit::HidWriteStalled) => {
+                                error!("BLE HID output stalled, disconnecting for a fail-closed reconnect");
+
+                                // Abandon every report from the unhealthy
+                                // session and make the first report after the
+                                // reconnect an all-up keyboard state. Sleeping
+                                // keeps any new local input queued while the
+                                // bonded host reconnects.
+                                report_activity();
+                                prepare_hid_write_recovery();
+
+                                if conn.raw().is_connected() {
+                                    disconnect_and_wait(&conn).await;
+                                }
+                                resuming_from_sleep = true;
+                            }
                             Either::Second(()) => {
                                 resuming_from_sleep = false;
                                 report_activity();
@@ -303,12 +328,7 @@ where
                                 // When the profile changes, manually disconnect
                                 // from the current host.
                                 if conn.raw().is_connected() {
-                                    conn.raw().disconnect();
-                                    loop {
-                                        if let GattConnectionEvent::Disconnected { .. } = conn.next().await {
-                                            break;
-                                        }
-                                    }
+                                    disconnect_and_wait(&conn).await;
                                 }
                             }
                         }
@@ -331,7 +351,7 @@ where
                         set_ble_state(BleState::Sleeping);
                         request_sleep();
 
-                        let wake = wake_during_advertising.unwrap_or_else(InputActivityWaiter::new);
+                        let wake = wake_during_advertising.into_waiter();
                         warn!("Advertising timeout, sleeping until local input");
 
                         match select(wake.wait(), profile_manager.update_profile()).await {
@@ -406,7 +426,16 @@ pub(crate) async fn ble_task<C: Controller + ControllerCmdAsync<LeSetPhy>, P: Pa
 ///
 /// This function will handle the GATT events and process them.
 /// This is how we interact with read and write requests.
-async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, DefaultPacketPool>) -> Result<(), Error> {
+async fn gatt_events_task<C>(
+    server: &Server<'_>,
+    conn: &GattConnection<'_, '_, DefaultPacketPool>,
+    stack: &Stack<'_, C, DefaultPacketPool>,
+    session_ready: &Signal<crate::RawMutex, ()>,
+    local_hid_suspend: bool,
+) -> Result<(), Error>
+where
+    C: Controller,
+{
     let level = server.battery_service.level;
     let output_keyboard = server.hid_service.output_keyboard;
     let hid_control_point = server.hid_service.hid_control_point;
@@ -463,7 +492,7 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
             }
             GattConnectionEvent::Encrypted { security_level, .. } => {
                 info!("[gatt] encrypted: {:?}", security_level);
-                set_ble_state(BleState::Connected);
+                mark_ble_session_ready(session_ready);
             }
             GattConnectionEvent::Gatt { event: gatt_event } => {
                 let mut cccd_updated = false;
@@ -515,10 +544,11 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                             //   - 0: HID_CTRL_SUSPEND
                             //   - 1: HID_CTRL_EXIT_SUSPEND
                             if data_len == 1 {
-                                match data[0] {
-                                    0 => request_sleep(),
-                                    1 => report_activity(),
-                                    _ => {}
+                                match hid_control_point_action(data[0], local_hid_suspend) {
+                                    HidControlPointAction::Disconnect => request_sleep(),
+                                    HidControlPointAction::LocalSleep => request_local_sleep(),
+                                    HidControlPointAction::Activity => report_activity(),
+                                    HidControlPointAction::Ignore => {}
                                 }
                             }
                         } else {
@@ -602,13 +632,24 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                     supervision_timeout.as_millis()
                 );
             }
-            GattConnectionEvent::RequestConnectionParams(req) => info!(
-                "[gatt] RequestConnectionParams: interval: ({:?}, {:?})ms, {:?}, {:?}ms",
-                req.params().min_connection_interval.as_millis(),
-                req.params().max_connection_interval.as_millis(),
-                req.params().max_latency,
-                req.params().supervision_timeout.as_millis(),
-            ),
+            GattConnectionEvent::RequestConnectionParams(req) => {
+                info!(
+                    "[gatt] RequestConnectionParams: interval: ({:?}, {:?})ms, {:?}, {:?}ms",
+                    req.params().min_connection_interval.as_millis(),
+                    req.params().max_connection_interval.as_millis(),
+                    req.params().max_latency,
+                    req.params().supervision_timeout.as_millis(),
+                );
+
+                // The host connection policy is owned locally; reject peer
+                // updates so an unsolicited request cannot replace it.
+                let response = req.reject(stack).await;
+                if let Err(e) = response {
+                    #[cfg(feature = "defmt")]
+                    let e = defmt::Debug2Format(&e);
+                    warn!("[gatt] failed to respond to connection parameters: {:?}", e);
+                }
+            }
             GattConnectionEvent::DataLengthUpdated {
                 max_tx_octets,
                 max_tx_time,
@@ -712,7 +753,8 @@ async fn advertise<'a, 'b, C: Controller>(
     };
 
     let reconnect_timeout_secs = u64::from(crate::BLE_RECONNECT_TIMEOUT_SECONDS);
-    let reconnect_timeout_ms = reconnect_timeout_secs * 1_000;
+    let reconnect_timeout_ms = reconnect_timeout_secs.saturating_mul(1_000);
+    let bonded_windows = bonded_reconnect_windows(reconnect_timeout_ms);
     let configured_pairing_timeout = u64::from(crate::BLE_PAIRING_TIMEOUT_SECONDS);
     let has_active_peer = active_peer.is_some();
     let pairing_window_secs =
@@ -724,7 +766,7 @@ async fn advertise<'a, 'b, C: Controller>(
     }
 
     if let Some(peer) = active_peer {
-        let high_duty_window_ms = reconnect_timeout_ms.min(DIRECTED_RECONNECT_WINDOW_MS);
+        let high_duty_window_ms = bonded_windows.directed_high_duty_ms;
         if high_duty_window_ms > 0 {
             info!("[adv] directed high duty reconnect");
             let advertiser = peripheral
@@ -752,29 +794,69 @@ async fn advertise<'a, 'b, C: Controller>(
             }
         }
 
-        let remaining_reconnect_ms = reconnect_timeout_ms.saturating_sub(high_duty_window_ms);
-        if remaining_reconnect_ms > 0 {
+        if bonded_windows.fast_undirected_ms > 0 || bonded_windows.slow_undirected_ms > 0 {
             // Directed advertising is not rediscovered reliably by every host
             // after a peripheral-initiated idle disconnect. Fall back to an
             // undirected advertisement restricted to the bonded peer: the OS
             // can scan and reconnect normally, while a new host still cannot
             // connect or start pairing.
             peripheral.set_filter_accept_list(&[peer]).await?;
-            let bonded_reconnect_config = AdvertisementParameters {
+        }
+
+        if bonded_windows.fast_undirected_ms > 0 {
+            let fast_bonded_reconnect_config = AdvertisementParameters {
                 filter_policy: bonded_reconnect_filter_policy(),
-                ..slow_advertise_config
+                ..fast_advertise_config
             };
-            info!("[adv] filtered bonded-host reconnect");
+            info!("[adv] fast filtered bonded-host reconnect");
             let advertiser = peripheral
                 .advertise(
-                    &bonded_reconnect_config,
+                    &fast_bonded_reconnect_config,
                     Advertisement::ConnectableScannableUndirected {
                         adv_data: &advertiser_data[..],
                         scan_data: &[],
                     },
                 )
                 .await?;
-            match with_timeout(Duration::from_millis(remaining_reconnect_ms), advertiser.accept()).await {
+            match with_timeout(
+                Duration::from_millis(bonded_windows.fast_undirected_ms),
+                advertiser.accept(),
+            )
+            .await
+            {
+                Ok(conn_res) => {
+                    let conn = conn_res?.with_attribute_server(server)?;
+                    info!("[adv] bonded host connection established");
+                    if let Err(e) = conn.raw().set_bondable(false) {
+                        error!("Set bondable error: {:?}", e);
+                    }
+                    return Ok(conn);
+                }
+                Err(_) => info!("[adv] fast bonded-host reconnect window elapsed"),
+            }
+        }
+
+        if bonded_windows.slow_undirected_ms > 0 {
+            let slow_bonded_reconnect_config = AdvertisementParameters {
+                filter_policy: bonded_reconnect_filter_policy(),
+                ..slow_advertise_config
+            };
+            info!("[adv] slow filtered bonded-host reconnect");
+            let advertiser = peripheral
+                .advertise(
+                    &slow_bonded_reconnect_config,
+                    Advertisement::ConnectableScannableUndirected {
+                        adv_data: &advertiser_data[..],
+                        scan_data: &[],
+                    },
+                )
+                .await?;
+            match with_timeout(
+                Duration::from_millis(bonded_windows.slow_undirected_ms),
+                advertiser.accept(),
+            )
+            .await
+            {
                 Ok(conn_res) => {
                     let conn = conn_res?.with_attribute_server(server)?;
                     info!("[adv] bonded host connection established");
@@ -864,6 +946,29 @@ fn bonded_reconnect_filter_policy() -> AdvFilterPolicy {
     AdvFilterPolicy::FilterConn
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BondedReconnectWindows {
+    directed_high_duty_ms: u64,
+    fast_undirected_ms: u64,
+    slow_undirected_ms: u64,
+}
+
+fn bonded_reconnect_windows(reconnect_timeout_ms: u64) -> BondedReconnectWindows {
+    let directed_high_duty_ms = reconnect_timeout_ms.min(DIRECTED_RECONNECT_WINDOW_MS);
+    let fast_undirected_ms = reconnect_timeout_ms
+        .min(FAST_BONDED_RECONNECT_TOTAL_MS)
+        .saturating_sub(directed_high_duty_ms);
+    let slow_undirected_ms = reconnect_timeout_ms
+        .saturating_sub(directed_high_duty_ms)
+        .saturating_sub(fast_undirected_ms);
+
+    BondedReconnectWindows {
+        directed_high_duty_ms,
+        fast_undirected_ms,
+        slow_undirected_ms,
+    }
+}
+
 fn pairing_window_timeout_secs(
     has_active_bond: bool,
     configured_pairing_timeout_secs: u64,
@@ -886,6 +991,76 @@ fn directed_reconnect_should_continue(error: &Error) -> bool {
 enum BleKeyboardExit {
     Disconnected,
     IdleTimeout,
+    HidWriteStalled,
+}
+
+/// Owns the temporary input subscriptions used only while a sleeping host is
+/// being advertised to.
+///
+/// A successful connection must consume this guard before the long-lived BLE
+/// session starts. Otherwise its unread PubSub subscribers retain every key
+/// and pointing event until the bounded event queues stop the input producers.
+struct WakeAdvertisingInput {
+    waiter: Option<InputActivityWaiter>,
+}
+
+impl WakeAdvertisingInput {
+    fn new(resuming_from_sleep: bool) -> Self {
+        Self {
+            waiter: resuming_from_sleep.then(InputActivityWaiter::new),
+        }
+    }
+
+    fn connected(self) {
+        drop(self.waiter);
+    }
+
+    fn into_waiter(self) -> InputActivityWaiter {
+        self.waiter.unwrap_or_else(InputActivityWaiter::new)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HidControlPointAction {
+    Disconnect,
+    LocalSleep,
+    Activity,
+    Ignore,
+}
+
+fn hid_control_point_action(opcode: u8, local_suspend: bool) -> HidControlPointAction {
+    match opcode {
+        0 if local_suspend => HidControlPointAction::LocalSleep,
+        0 => HidControlPointAction::Disconnect,
+        1 => HidControlPointAction::Activity,
+        _ => HidControlPointAction::Ignore,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostConnParamBootstrap {
+    Legacy,
+    PreserveNegotiated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostLinkStartupPolicy {
+    update_phy: bool,
+    conn_params: HostConnParamBootstrap,
+}
+
+fn host_link_startup_policy(has_active_bond: bool, preserve_bonded_link: bool) -> HostLinkStartupPolicy {
+    if has_active_bond && preserve_bonded_link {
+        HostLinkStartupPolicy {
+            update_phy: false,
+            conn_params: HostConnParamBootstrap::PreserveNegotiated,
+        }
+    } else {
+        HostLinkStartupPolicy {
+            update_phy: true,
+            conn_params: HostConnParamBootstrap::Legacy,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -939,33 +1114,43 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
     stack: &Stack<'_, C, P>,
     conn: &GattConnection<'a, 'b, P>,
     host_power_config: Option<BleHostPowerConfig>,
+    bootstrap: HostConnParamBootstrap,
 ) -> BleKeyboardExit {
     if host_power_config.is_some() {
         reset_host_power_input();
         HOST_POWER_CONFIG_CHANGED.reset();
     }
 
-    // Wait for 5 seconds before setting connection parameters to avoid connection drop
-    embassy_time::Timer::after_secs(5).await;
+    match bootstrap {
+        HostConnParamBootstrap::Legacy => {
+            // Wait for 5 seconds before setting connection parameters to avoid
+            // dropping a newly paired connection.
+            Timer::after_secs(5).await;
 
-    // For macOS/iOS(aka Apple devices), both interval should be set to 15ms
-    // Reference: https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
-    update_conn_params(
-        stack,
-        conn.raw(),
-        &host_connection_params(Duration::from_millis(15), HOST_IDLE_MAX_LATENCY),
-    )
-    .await;
+            // For macOS/iOS (aka Apple devices), both intervals should be 15 ms.
+            // Reference: https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
+            update_conn_params(
+                stack,
+                conn.raw(),
+                &host_connection_params(Duration::from_millis(15), HOST_IDLE_MAX_LATENCY),
+            )
+            .await;
 
-    embassy_time::Timer::after_secs(5).await;
+            Timer::after_secs(5).await;
 
-    // Setting the conn param the second time ensures that we have best performance on all platforms
-    update_conn_params(
-        stack,
-        conn.raw(),
-        &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
-    )
-    .await;
+            // A second update gives a fresh connection the best performance
+            // on all supported hosts.
+            update_conn_params(
+                stack,
+                conn.raw(),
+                &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
+            )
+            .await;
+        }
+        HostConnParamBootstrap::PreserveNegotiated => {
+            info!("Bonded BLE session, preserving host-negotiated connection parameters");
+        }
+    }
 
     if let Some(config) = host_power_config {
         let mut last_activity = Instant::now();
@@ -992,7 +1177,9 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                 Either4::First(immediate_suspend) => {
                     if immediate_suspend {
                         set_ble_state(BleState::Sleeping);
-                        request_sleep();
+                        // The producer already signalled the persistent sleep
+                        // manager. Re-signalling here can overwrite a key's
+                        // concurrent activity notification in HOST_POWER_INPUT.
                         return BleKeyboardExit::IdleTimeout;
                     }
 
@@ -1010,7 +1197,7 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                 }
                 Either4::Second(()) => {
                     // Preserve last_activity and recalculate the deadline from
-                    // the newly selected runtime setting.
+                    // the caller's updated runtime policy.
                 }
                 Either4::Third(()) => {
                     let now = Instant::now();
@@ -1100,18 +1287,18 @@ fn host_connection_params(interval: Duration, max_latency: u16) -> RequestedConn
     }
 }
 
-/// Run BLE keyboard for one connection.
-///
-/// Returns when the connection drops or its full idle timeout expires.
-/// `writer_task`, `led_task`, and `host_task` are all infinite, so the outer
-/// `select(communication_task, inner)` cancels them as a side-effect of
-/// `communication_task` returning. `inner` itself never completes.
+/// Seed the battery characteristic before the host can read it.
 fn seed_battery_level(server: &Server<'_>, status: BatteryStatus) {
     if let BatteryStatus::Available { level: Some(level), .. } = status {
         server.set(&server.battery_service.level, &level).unwrap();
     }
 }
 
+/// Run BLE keyboard for one connection.
+///
+/// Returns when the connection drops or its full idle timeout expires. The
+/// GATT event pump starts immediately so security events cannot queue behind
+/// PHY setup; only HID output waits for bonded encryption.
 async fn run_ble_keyboard<
     'a,
     'b,
@@ -1126,6 +1313,7 @@ async fn run_ble_keyboard<
     #[cfg(feature = "storage")] active_bond_info: Option<crate::ble::profile::ProfileInfo>,
     config: &BleBatteryConfig<'a>,
     host_power_config: Option<BleHostPowerConfig>,
+    host_link_policy: HostLinkStartupPolicy,
 ) -> BleKeyboardExit {
     #[cfg(feature = "host")]
     VIAL_BLE_ACTIVITY.reset();
@@ -1154,38 +1342,35 @@ async fn run_ble_keyboard<
         }
     }
 
-    // Advertising stays on the universally discoverable LE 1M PHY. Verify
-    // that the established host link actually upgrades to LE 2M: accepting
-    // LE Set PHY only schedules the controller procedure and does not prove
-    // that the peer completed it.
-    ensure_host_ble_2m_phy(stack, conn.raw()).await;
+    // This is a per-connection barrier, not a second connection state. The
+    // GATT event pump must start immediately because trouble-host's bounded
+    // connection-event queue can otherwise lose the Encrypted notification
+    // while local PHY setup is still pending. Only queued HID output waits for
+    // bonded encryption.
+    let session_ready: Signal<crate::RawMutex, ()> = Signal::new();
 
-    let communication_task = async {
-        match select3(
-            gatt_events_task(server, conn),
-            set_conn_params(stack, conn, host_power_config),
-            ble_battery_server.run(),
-        )
-        .await
-        {
-            Either3::First(e) => {
-                error!("[gatt_events_task] end: {:?}", e);
-                BleKeyboardExit::Disconnected
+    let gatt_task = run_until_physical_disconnect(
+        async {
+            let e = gatt_events_task(server, conn, stack, &session_ready, host_power_config.is_some()).await;
+            error!("[gatt_events_task] end: {:?}", e);
+            BleKeyboardExit::Disconnected
+        },
+        || conn.raw().is_connected(),
+    );
+    let communication_task = run_ble_communication_tasks(
+        gatt_task,
+        set_conn_params(stack, conn, host_power_config, host_link_policy.conn_params),
+        ble_battery_server.run(),
+        async {
+            if host_link_policy.update_phy {
+                ensure_host_ble_2m_phy(stack, conn.raw()).await;
+            } else {
+                info!("Bonded BLE session, preserving host-negotiated PHY");
             }
-            Either3::Second(exit) => exit,
-            Either3::Third(_) => unreachable!("BLE battery service must run forever"),
-        }
-    };
+        },
+    );
 
-    let writer_task = async {
-        loop {
-            let report = BLE_REPORT_CHANNEL.receive().await;
-            if let Err(e) = ble_hid_server.write_report(&report).await {
-                error!("Failed to send report: {:?}", e);
-            }
-        }
-    };
-
+    let writer_task = run_ble_hid_writer(&mut ble_hid_server, host_power_config.is_some());
     let led_task = run_led_reader(&mut ble_led_reader, ConnectionType::Ble);
 
     #[cfg(feature = "host")]
@@ -1193,11 +1378,173 @@ async fn run_ble_keyboard<
     #[cfg(not(feature = "host"))]
     let host_task = core::future::pending::<()>();
 
-    let inner = embassy_futures::join::join3(writer_task, led_task, host_task);
-    match select(communication_task, inner).await {
+    let workers = run_ble_session_workers(&session_ready, writer_task, led_task, host_task);
+
+    match select(communication_task, workers).await {
         Either::First(exit) => exit,
-        Either::Second(_) => unreachable!("BLE session workers must run forever"),
+        Either::Second(exit) => exit,
     }
+}
+
+async fn run_until_physical_disconnect<G, F>(gatt_task: G, is_connected: F) -> BleKeyboardExit
+where
+    G: core::future::Future<Output = BleKeyboardExit>,
+    F: FnMut() -> bool,
+{
+    match select(gatt_task, wait_for_physical_disconnect(is_connected)).await {
+        Either::First(exit) => exit,
+        Either::Second(()) => {
+            warn!("[gatt] physical link closed without a connection event");
+            BleKeyboardExit::Disconnected
+        }
+    }
+}
+
+async fn wait_for_physical_disconnect<F>(mut is_connected: F)
+where
+    F: FnMut() -> bool,
+{
+    loop {
+        if !is_connected() {
+            return;
+        }
+        Timer::after_millis(HOST_CONNECTION_LIVENESS_POLL_MS).await;
+    }
+}
+
+async fn disconnect_and_wait<P: PacketPool>(conn: &GattConnection<'_, '_, P>) {
+    conn.raw().disconnect();
+    let disconnected_event = async {
+        loop {
+            if let GattConnectionEvent::Disconnected { .. } = conn.next().await {
+                return;
+            }
+        }
+    };
+
+    // Trouble may drop Disconnected when its bounded event queue is full.
+    // Physical link state is authoritative and prevents teardown hanging.
+    select(
+        disconnected_event,
+        wait_for_physical_disconnect(|| conn.raw().is_connected()),
+    )
+    .await;
+}
+
+async fn run_ble_communication_tasks<G, C, B, P>(
+    gatt_task: G,
+    conn_params_task: C,
+    battery_task: B,
+    phy_task: P,
+) -> BleKeyboardExit
+where
+    G: core::future::Future<Output = BleKeyboardExit>,
+    C: core::future::Future<Output = BleKeyboardExit>,
+    B: core::future::Future,
+    P: core::future::Future,
+{
+    // PHY setup is finite but must stay part of the connection lifetime after
+    // it completes. Its HCI mutex still serializes controller commands with
+    // split-link updates; running it beside GATT only keeps event consumption
+    // live while that procedure is pending.
+    let phy_task = async {
+        phy_task.await;
+        core::future::pending::<()>().await;
+    };
+
+    match select4(gatt_task, conn_params_task, battery_task, phy_task).await {
+        Either4::First(exit) | Either4::Second(exit) => exit,
+        Either4::Third(_) => unreachable!("BLE battery service must run forever"),
+        Either4::Fourth(_) => unreachable!("BLE PHY keeper must run forever"),
+    }
+}
+
+#[cfg(test)]
+async fn join_ble_session_workers<H, L, V>(
+    session_ready: &Signal<crate::RawMutex, ()>,
+    hid_task: H,
+    led_task: L,
+    host_task: V,
+) -> (H::Output, L::Output, V::Output)
+where
+    H: core::future::Future,
+    L: core::future::Future,
+    V: core::future::Future,
+{
+    join3(after_ble_session_ready(session_ready, hid_task), led_task, host_task).await
+}
+
+async fn run_ble_session_workers<H, L, V>(
+    session_ready: &Signal<crate::RawMutex, ()>,
+    hid_task: H,
+    led_task: L,
+    host_task: V,
+) -> H::Output
+where
+    H: core::future::Future,
+    L: core::future::Future,
+    V: core::future::Future,
+{
+    let background_tasks = async {
+        embassy_futures::join::join(led_task, host_task).await;
+        core::future::pending::<H::Output>().await
+    };
+
+    match select(after_ble_session_ready(session_ready, hid_task), background_tasks).await {
+        Either::First(exit) => exit,
+        Either::Second(exit) => exit,
+    }
+}
+
+async fn after_ble_session_ready<F>(session_ready: &Signal<crate::RawMutex, ()>, task: F) -> F::Output
+where
+    F: core::future::Future,
+{
+    session_ready.wait().await;
+    task.await
+}
+
+fn mark_ble_session_ready(session_ready: &Signal<crate::RawMutex, ()>) {
+    // A physical BLE connection is not ready for HID traffic until bonded
+    // encryption has completed. Publish the authoritative state first, then
+    // release the per-connection workers so queued reports cannot race it.
+    set_ble_state(BleState::Connected);
+    session_ready.signal(());
+}
+
+async fn run_ble_hid_writer<W>(writer: &mut W, fail_closed: bool) -> BleKeyboardExit
+where
+    W: HidWriterTrait<ReportType = crate::hid::Report>,
+{
+    loop {
+        let report = BLE_REPORT_CHANNEL.receive().await;
+
+        if fail_closed {
+            match with_timeout(
+                Duration::from_secs(HID_WRITE_TIMEOUT_SECS),
+                writer.write_report(&report),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    error!("Failed to send BLE HID report: {:?}", e);
+                    return BleKeyboardExit::HidWriteStalled;
+                }
+                Err(_) => {
+                    error!("Timed out sending BLE HID report");
+                    return BleKeyboardExit::HidWriteStalled;
+                }
+            }
+        } else if let Err(e) = writer.write_report(&report).await {
+            error!("Failed to send report: {:?}", e);
+        }
+    }
+}
+
+fn prepare_hid_write_recovery() {
+    crate::channel::clear_and_release_report_channel(ConnectionType::Ble);
+    set_ble_state(BleState::Sleeping);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1222,6 +1569,7 @@ where
     C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadPhy>,
     P: PacketPool,
 {
+    let _guard = BLE_HCI_LINK_UPDATE_MUTEX.lock().await;
     for attempt in 1..=HOST_PHY_UPDATE_ATTEMPTS {
         match conn.set_phy(stack, PhyKind::Le2M).await {
             Ok(()) => info!(
@@ -1373,9 +1721,12 @@ fn is_hci_link_update_busy(status: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use core::cell::Cell;
     use std::sync::{Mutex, OnceLock};
 
     use embassy_futures::join::join;
+    use embassy_futures::select::{Either, select};
+    use embassy_sync::signal::Signal;
     use embassy_time::{Duration, Timer};
     use rmk_types::battery::{BatteryStatus, ChargeState};
     use rmk_types::ble::{BleState, BleStatus};
@@ -1383,13 +1734,22 @@ mod tests {
     use trouble_host::prelude::{AdvFilterPolicy, PhyKind};
 
     use super::{
-        HostPhyUpdateState, HostPowerTransition, Server, advertising_mode, bonded_reconnect_filter_policy,
-        directed_reconnect_should_continue, host_phy_update_state, is_hci_link_update_busy, next_host_power_transition,
-        pairing_window_timeout_secs, seed_battery_level,
+        BleKeyboardExit, BondedReconnectWindows, HidControlPointAction, HostConnParamBootstrap, HostLinkStartupPolicy,
+        HostPhyUpdateState, HostPowerTransition, Server, WakeAdvertisingInput, advertising_mode,
+        bonded_reconnect_filter_policy, bonded_reconnect_windows, directed_reconnect_should_continue,
+        hid_control_point_action, host_link_startup_policy, host_phy_update_state, is_hci_link_update_busy,
+        join_ble_session_workers, mark_ble_session_ready, next_host_power_transition, pairing_window_timeout_secs,
+        prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer, run_ble_session_workers,
+        run_until_physical_disconnect, seed_battery_level,
     };
     use crate::ble::sleep::wait_for_input_activity;
+    use crate::channel::BLE_REPORT_CHANNEL;
     use crate::config::BleHostPowerConfig;
-    use crate::event::{Axis, AxisEvent, AxisValType, BleAdvertisingMode, PointingEvent, publish_event};
+    use crate::event::{
+        Axis, AxisEvent, AxisValType, BleAdvertisingMode, EventSubscriber, KeyboardEvent, PointingEvent,
+        SubscribableEvent, publish_event, publish_event_async,
+    };
+    use crate::hid::{KeyboardReport, Report};
     use crate::state::{
         current_ble_advertising_mode, current_ble_status, set_ble_advertising_mode, set_ble_profile, set_ble_state,
     };
@@ -1398,6 +1758,54 @@ mod tests {
     fn ble_status_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn successful_wake_advertising_releases_temporary_input_subscribers() {
+        let mut keyboard = KeyboardEvent::subscriber();
+        WakeAdvertisingInput::new(true).connected();
+
+        let final_event = block_on(async {
+            select(
+                async {
+                    join(
+                        async {
+                            // The wake release plus seven taps fill all 15
+                            // remaining slots held by the leaked subscriber.
+                            publish_event_async(KeyboardEvent::key(0, 0, false)).await;
+                            for _ in 0..7 {
+                                publish_event_async(KeyboardEvent::key(0, 0, true)).await;
+                                publish_event_async(KeyboardEvent::key(0, 0, false)).await;
+                            }
+
+                            // Previously this press reached HID as event 16,
+                            // while its release (event 17) blocked forever.
+                            publish_event_async(KeyboardEvent::key(0, 0, true)).await;
+                            publish_event_async(KeyboardEvent::key(0, 0, false)).await;
+                        },
+                        async {
+                            let mut final_event = None;
+                            for _ in 0..17 {
+                                final_event = Some(keyboard.next_event().await);
+                            }
+                            final_event.unwrap()
+                        },
+                    )
+                    .await
+                    .1
+                },
+                async {
+                    Timer::after_millis(10).await;
+                    panic!("keyboard publication remained blocked by a stale wake subscriber")
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            final_event,
+            Either::First(KeyboardEvent { pressed: false, .. })
+        ));
     }
 
     #[test]
@@ -1422,6 +1830,99 @@ mod tests {
     fn bonded_reconnect_is_undirected_but_connection_filtered() {
         assert_eq!(bonded_reconnect_filter_policy(), AdvFilterPolicy::FilterConn);
         assert_eq!(pairing_window_timeout_secs(true, 30, 10), None);
+    }
+
+    #[test]
+    fn bonded_reconnect_uses_fast_undirected_until_five_seconds_total() {
+        assert_eq!(
+            bonded_reconnect_windows(10_000),
+            BondedReconnectWindows {
+                directed_high_duty_ms: 1_300,
+                fast_undirected_ms: 3_700,
+                slow_undirected_ms: 5_000,
+            }
+        );
+    }
+
+    #[test]
+    fn bonded_reconnect_windows_fit_short_timeouts_without_underflow() {
+        assert_eq!(
+            bonded_reconnect_windows(500),
+            BondedReconnectWindows {
+                directed_high_duty_ms: 500,
+                fast_undirected_ms: 0,
+                slow_undirected_ms: 0,
+            }
+        );
+        assert_eq!(
+            bonded_reconnect_windows(3_000),
+            BondedReconnectWindows {
+                directed_high_duty_ms: 1_300,
+                fast_undirected_ms: 1_700,
+                slow_undirected_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn bonded_reconnect_windows_preserve_zero_and_large_timeouts() {
+        assert_eq!(
+            bonded_reconnect_windows(0),
+            BondedReconnectWindows {
+                directed_high_duty_ms: 0,
+                fast_undirected_ms: 0,
+                slow_undirected_ms: 0,
+            }
+        );
+        assert_eq!(
+            bonded_reconnect_windows(u64::MAX),
+            BondedReconnectWindows {
+                directed_high_duty_ms: 1_300,
+                fast_undirected_ms: 3_700,
+                slow_undirected_ms: u64::MAX - 5_000,
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_session_always_keeps_the_production_link_bootstrap() {
+        assert_eq!(
+            host_link_startup_policy(false, true),
+            HostLinkStartupPolicy {
+                update_phy: true,
+                conn_params: HostConnParamBootstrap::Legacy,
+            }
+        );
+    }
+
+    #[test]
+    fn bonded_host_power_session_preserves_the_negotiated_link() {
+        assert_eq!(
+            host_link_startup_policy(true, true),
+            HostLinkStartupPolicy {
+                update_phy: false,
+                conn_params: HostConnParamBootstrap::PreserveNegotiated,
+            }
+        );
+    }
+
+    #[test]
+    fn bonded_session_without_host_power_policy_uses_legacy_bootstrap() {
+        assert_eq!(
+            host_link_startup_policy(true, false),
+            HostLinkStartupPolicy {
+                update_phy: true,
+                conn_params: HostConnParamBootstrap::Legacy,
+            }
+        );
+    }
+
+    #[test]
+    fn hid_suspend_is_local_only_for_host_power_managed_links() {
+        assert_eq!(hid_control_point_action(0, true), HidControlPointAction::LocalSleep);
+        assert_eq!(hid_control_point_action(0, false), HidControlPointAction::Disconnect);
+        assert_eq!(hid_control_point_action(1, true), HidControlPointAction::Activity);
+        assert_eq!(hid_control_point_action(2, true), HidControlPointAction::Ignore);
     }
 
     #[test]
@@ -1486,6 +1987,7 @@ mod tests {
         assert_eq!(idle.max_latency, 30);
         assert_eq!(interactive.max_latency, 0);
         assert_eq!(idle.supervision_timeout, interactive.supervision_timeout);
+        assert_eq!(idle.supervision_timeout, Duration::from_secs(5));
     }
 
     fn ten_minute_disconnect_timeout() -> u64 {
@@ -1599,6 +2101,186 @@ mod tests {
                 state: BleState::Inactive,
             }
         );
+    }
+
+    #[test]
+    fn hid_worker_exit_ends_session_while_background_workers_are_pending() {
+        let session_ready: Signal<crate::RawMutex, ()> = Signal::new();
+        session_ready.signal(());
+
+        let exit = block_on(run_ble_session_workers(
+            &session_ready,
+            async { BleKeyboardExit::Disconnected },
+            core::future::pending::<()>(),
+            core::future::pending::<()>(),
+        ));
+
+        assert_eq!(exit, BleKeyboardExit::Disconnected);
+    }
+
+    struct PendingBleHidWriter;
+
+    impl crate::hid::HidWriterTrait for PendingBleHidWriter {
+        type ReportType = Report;
+
+        fn write_report(
+            &mut self,
+            _report: &Self::ReportType,
+        ) -> impl core::future::Future<Output = Result<usize, crate::hid::HidError>> {
+            core::future::pending()
+        }
+    }
+
+    #[test]
+    fn stalled_hid_write_exits_after_bounded_timeout() {
+        let _guard = ble_status_test_lock().lock().unwrap();
+        BLE_REPORT_CHANNEL.clear();
+        BLE_REPORT_CHANNEL
+            .try_send(Report::KeyboardReport(KeyboardReport::default()))
+            .expect("BLE report channel should have capacity");
+
+        let mut writer = PendingBleHidWriter;
+        let exit = block_on(run_ble_hid_writer(&mut writer, true));
+
+        assert_eq!(exit, BleKeyboardExit::HidWriteStalled);
+        assert!(BLE_REPORT_CHANNEL.is_empty());
+    }
+
+    #[test]
+    fn hid_stall_recovery_discards_stale_reports_and_queues_all_up() {
+        let _guard = ble_status_test_lock().lock().unwrap();
+        BLE_REPORT_CHANNEL.clear();
+        set_ble_state(BleState::Connected);
+        BLE_REPORT_CHANNEL
+            .try_send(Report::KeyboardReport(KeyboardReport {
+                modifier: 0,
+                reserved: 0,
+                leds: 0,
+                keycodes: [4, 0, 0, 0, 0, 0],
+            }))
+            .expect("BLE report channel should have capacity");
+
+        prepare_hid_write_recovery();
+
+        assert_eq!(current_ble_status().state, BleState::Sleeping);
+        assert_eq!(BLE_REPORT_CHANNEL.len(), 1);
+        assert!(matches!(
+            BLE_REPORT_CHANNEL.try_receive(),
+            Ok(Report::KeyboardReport(report)) if report.modifier == 0 && report.keycodes == [0; 6]
+        ));
+
+        set_ble_state(BleState::Inactive);
+        BLE_REPORT_CHANNEL.clear();
+    }
+
+    #[test]
+    fn only_hid_output_waits_for_encrypted_session() {
+        let _guard = ble_status_test_lock().lock().unwrap();
+        let session_ready: Signal<crate::RawMutex, ()> = Signal::new();
+        let hid_started = Cell::new(false);
+        let led_started = Cell::new(false);
+        let host_started = Cell::new(false);
+
+        BLE_REPORT_CHANNEL.clear();
+        set_ble_state(BleState::Sleeping);
+        assert!(
+            BLE_REPORT_CHANNEL
+                .try_send(Report::KeyboardReport(KeyboardReport {
+                    modifier: 0,
+                    reserved: 0,
+                    leds: 0,
+                    keycodes: [4, 0, 0, 0, 0, 0],
+                }))
+                .is_ok()
+        );
+        assert!(
+            BLE_REPORT_CHANNEL
+                .try_send(Report::KeyboardReport(KeyboardReport::default()))
+                .is_ok()
+        );
+
+        let ((pressed, released), (), ()) = block_on(async {
+            join(
+                join_ble_session_workers(
+                    &session_ready,
+                    async {
+                        hid_started.set(true);
+                        (BLE_REPORT_CHANNEL.receive().await, BLE_REPORT_CHANNEL.receive().await)
+                    },
+                    async { led_started.set(true) },
+                    async { host_started.set(true) },
+                ),
+                async {
+                    Timer::after_millis(1).await;
+                    assert!(led_started.get(), "LED work must retain its established startup order");
+                    assert!(
+                        host_started.get(),
+                        "host service must retain its established startup order"
+                    );
+                    assert!(!hid_started.get(), "physical connection must not release HID output");
+                    assert_eq!(BLE_REPORT_CHANNEL.len(), 2, "wake press/release must remain queued");
+
+                    mark_ble_session_ready(&session_ready);
+                },
+            )
+            .await
+            .0
+        });
+
+        assert!(hid_started.get());
+        assert!(matches!(pressed, Report::KeyboardReport(report) if report.keycodes[0] == 4));
+        assert!(matches!(released, Report::KeyboardReport(report) if report.keycodes == [0; 6]));
+        assert_eq!(current_ble_status().state, BleState::Connected);
+        assert!(BLE_REPORT_CHANNEL.is_empty());
+
+        set_ble_state(BleState::Inactive);
+    }
+
+    #[test]
+    fn gatt_event_pump_runs_while_host_phy_setup_is_pending() {
+        let gatt_polled = Cell::new(false);
+        let phy_polled = Cell::new(false);
+
+        let exit = block_on(run_ble_communication_tasks(
+            async {
+                gatt_polled.set(true);
+                Timer::after_millis(1).await;
+                assert!(phy_polled.get(), "PHY setup must run beside the GATT event pump");
+                BleKeyboardExit::Disconnected
+            },
+            core::future::pending::<BleKeyboardExit>(),
+            core::future::pending::<()>(),
+            async {
+                assert!(gatt_polled.get(), "GATT event consumption must start before PHY setup");
+                phy_polled.set(true);
+                core::future::pending::<()>().await;
+            },
+        ));
+
+        assert_eq!(exit, BleKeyboardExit::Disconnected);
+        assert!(gatt_polled.get());
+        assert!(phy_polled.get());
+    }
+
+    #[test]
+    fn physical_disconnect_recovers_when_connection_event_is_missing() {
+        let physically_connected = Cell::new(true);
+
+        let exit = block_on(async {
+            join(
+                run_until_physical_disconnect(core::future::pending::<BleKeyboardExit>(), || {
+                    physically_connected.get()
+                }),
+                async {
+                    Timer::after_millis(super::HOST_CONNECTION_LIVENESS_POLL_MS + 1).await;
+                    physically_connected.set(false);
+                },
+            )
+            .await
+            .0
+        });
+
+        assert_eq!(exit, BleKeyboardExit::Disconnected);
     }
 
     #[test]

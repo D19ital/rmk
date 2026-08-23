@@ -568,6 +568,15 @@ for file in keyboards/k04/src/layer_names.rs; do
         || fail "$file: K:04 settings migration version drifted"
     rg -Fq 'migrate_legacy_placeholders();' "$file" \
         || fail "$file: generated layer-name migration is missing"
+    if rg -q '\b323\b' "$file"; then
+        fail "$file: removed host disconnect QSID 323 is still handled"
+    fi
+    rg -Fq 'const IDX_RESERVED_HOST_DISCONNECT_TIMEOUT: usize = 37;' "$file" \
+        || fail "$file: reserved host-timeout storage byte moved"
+    rg -Fq 'fn host_disconnect_timeout_seconds() -> u64 {' "$file" \
+        || fail "$file: fixed K:04 host disconnect policy is missing"
+    rg -Fq '    30 * 60' "$file" \
+        || fail "$file: K:04 host disconnect policy is not fixed at 30 minutes"
 done
 
 k04_vial_definitions=(
@@ -611,11 +620,13 @@ expected_active = [
 
 for path in sys.argv[1:]:
     with open(path, encoding="utf-8") as source:
-        custom_keycodes = json.load(source)["customKeycodes"]
+        definition = json.load(source)
+        custom_keycodes = definition["customKeycodes"]
 
     assert [entry["name"] for entry in custom_keycodes[:19]] == expected_reserved
     assert all(entry["shortName"] == "" and entry["title"] == "" for entry in custom_keycodes[:19])
     assert [entry["name"] for entry in custom_keycodes[19:]] == expected_active
+    assert all(field.get("qsid") != 323 for section in definition.get("settings", []) for field in section["fields"])
 PY
 
 classic_user_registry='BT0,BT1,BT2,BT3,BT4,BT_NEXT,BT_PREV,BT_CLR,BT_TOG,BT_PEER'
