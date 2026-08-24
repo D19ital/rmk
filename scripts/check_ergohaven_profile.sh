@@ -144,6 +144,7 @@ for file in "${profiles[@]}"; do
     expect_toml "$file" layers 16
     expect_toml "$file" no_action_layer_start 5
     expect_toml "$file" combo_max_num 32
+    expect_toml "$file" fork_max_num 32
     expect_toml "$file" morse_max_num 32
     expect_toml "$file" macro_space_size 2048
     expect_toml "$file" ble_profiles_num 5
@@ -361,7 +362,6 @@ PY
 
 for file in "${non_k04_profiles[@]}"; do
     expect_toml "$file" combo_max_length 4
-    expect_toml "$file" fork_max_num 8
     expect_toml "$file" max_patterns_per_key 8
     expect_toml "$file" protocol_max_bulk_size 8
     expect_toml "$file" protocol_macro_chunk_size 64

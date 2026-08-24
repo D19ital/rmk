@@ -7,11 +7,12 @@
 ### Features
 
 - Added two-stage host BLE power saving to all seven supported Ergohaven standalone profiles—K:03, K:04, K:04 Mini, K:04 Micro, Imperial44, OP36, and Velvet—with low-duty host link parameters after two minutes, a fixed host disconnect after 30 minutes, and fast bonded wake that retains the first supported input event
-- Advertised firmware-native Repeat/Again and Fork key-override capabilities to Entropy for the K:04 Series
+- Advertised firmware-native Repeat/Again and Fork key-override capabilities to Entropy for all 14 supported Ergohaven standalone and Qube profiles
 
 ### Improvements
 
 - Aligned the K:04 left-bracket key geometry with the surrounding row in Vial
+- Expanded Vial Key Override capacity from 8 to 32 slots across every supported Ergohaven profile
 - Updated the embedded firmware and package identity to v0.1.8 for all 14 supported Ergohaven standalone and Qube profiles
 
 ### Fixes

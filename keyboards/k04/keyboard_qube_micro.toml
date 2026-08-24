@@ -17,6 +17,7 @@ ble_reconnect_timeout_seconds = 60
 ble_pairing_timeout_seconds = 60
 split_central_sleep_timeout_seconds = 900
 combo_max_num = 32
+fork_max_num = 32
 morse_max_num = 32
 macro_space_size = 2048
 ble_profiles_num = 5

@@ -7,7 +7,7 @@ profiles share this software contract:
 - 32 combos, up to 4 keys each
 - 32 Morse / Tap Dance entries, up to 8 patterns each
 - 2048 bytes of macro storage
-- 8 forks
+- 32 forks / Vial Key Override slots
 - 5 Bluetooth profiles
 - protocol bulk size 8 and macro chunk size 64 bytes
 - Bluetooth reconnect and pairing windows of 60 seconds
