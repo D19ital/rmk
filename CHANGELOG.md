@@ -2,14 +2,23 @@
 
 ## Unreleased
 
-### Changed
+## v0.1.8
 
-- Fixed standalone K:04 host disconnect at 30 minutes and removed the stale hidden timeout setting from firmware and Vial definitions
+### Features
+
+- Added two-stage host BLE power saving for standalone K:04, K:04 Mini, and K:04 Micro, with low-duty parameters after two minutes, a fixed host disconnect after 30 minutes, and fast bonded wake that retains the first input event
+- Advertised firmware-native Repeat/Again and Fork key-override capabilities to Entropy for the K:04 Series
+
+### Improvements
+
+- Aligned the K:04 left-bracket key geometry with the surrounding row in Vial
 
 ### Fixes
 
 - Hardened bonded BLE wake through encryption, fast reconnect, local HID suspend, safe split-radio scheduling, stale-peer recovery, and fail-closed recovery from stalled HID notifications
 - Released temporary wake-input observers immediately after reconnect so their queues cannot block a key release and leave the last key repeating
+- Preserved queued input across sleeping reconnects and restored bonded reconnect and macro layer actions
+- Prevented K:04 from reporting a false full-battery state while charging
 
 ## v0.1.8-rc.5
 
