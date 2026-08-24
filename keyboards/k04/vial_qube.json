@@ -10,9 +10,9 @@
     },
     "firmware": {
         "name": "RMK",
-        "version": "0.1.7"
+        "version": "0.1.8"
     },
-    "firmwareVersion": "0.1.7",
+    "firmwareVersion": "0.1.8",
     "lighting": "none",
     "matrix": {
         "rows": 10,

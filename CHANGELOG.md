@@ -12,6 +12,7 @@
 ### Improvements
 
 - Aligned the K:04 left-bracket key geometry with the surrounding row in Vial
+- Updated the embedded firmware and package identity to v0.1.8 for all 14 supported Ergohaven standalone and Qube profiles
 
 ### Fixes
 

@@ -416,21 +416,10 @@ mapfile -t build_scripts < <(
         done
 )
 for file in "${build_scripts[@]}"; do
-    if [[ "$file" == keyboards/k04/build.rs ]]; then
-        rg -q 'const STANDALONE_FIRMWARE_VERSION: &str = "0\.1\.8";' "$file" \
-            || fail "$file: standalone firmware version must be 0.1.8"
-        rg -q 'const STANDALONE_FIRMWARE_VERSION_BCD: &str = "0x0108";' "$file" \
-            || fail "$file: standalone BCD firmware version must be 0x0108"
-        rg -q 'const QUBE_FIRMWARE_VERSION: &str = "0\.1\.7";' "$file" \
-            || fail "$file: Qube firmware version must remain 0.1.7"
-        rg -q 'const QUBE_FIRMWARE_VERSION_BCD: &str = "0x0107";' "$file" \
-            || fail "$file: Qube BCD firmware version must remain 0x0107"
-        continue
-    fi
-    rg -q 'const FIRMWARE_VERSION: &str = "0\.1\.7";' "$file" \
-        || fail "$file: firmware version must be 0.1.7"
-    rg -q 'const FIRMWARE_VERSION_BCD: &str = "0x0107";' "$file" \
-        || fail "$file: BCD firmware version must be 0x0107"
+    rg -q 'const FIRMWARE_VERSION: &str = "0\.1\.8";' "$file" \
+        || fail "$file: firmware version must be 0.1.8"
+    rg -q 'const FIRMWARE_VERSION_BCD: &str = "0x0108";' "$file" \
+        || fail "$file: BCD firmware version must be 0x0108"
 done
 
 mapfile -t vial_definitions < <(
@@ -440,20 +429,14 @@ mapfile -t vial_definitions < <(
         done
 )
 for file in "${vial_definitions[@]}"; do
-    expected_version=0.1.7
-    case "$file" in
-        keyboards/k04/vial.json|keyboards/k04/vial_mini.json|keyboards/k04/vial_micro.json)
-            expected_version=0.1.8
-            ;;
-    esac
     jq -e '.manufacturer == "Ergohaven"' "$file" >/dev/null \
         || fail "$file: manufacturer must be Ergohaven"
-    jq -e --arg expected_version "$expected_version" '
+    jq -e '
         .firmware.name == "RMK"
-        and .firmware.version == $expected_version
-        and .firmwareVersion == $expected_version
+        and .firmware.version == "0.1.8"
+        and .firmwareVersion == "0.1.8"
     ' "$file" >/dev/null \
-        || fail "$file: RMK identity and both firmware versions must equal $expected_version"
+        || fail "$file: RMK identity and both firmware versions must equal 0.1.8"
 done
 
 python3 - <<'PY' || fail "all production profiles must advertise their release package identity"

@@ -7,10 +7,8 @@ use const_gen::*;
 use xz2::read::XzEncoder;
 
 fn main() {
-    const STANDALONE_FIRMWARE_VERSION: &str = "0.1.8";
-    const STANDALONE_FIRMWARE_VERSION_BCD: &str = "0x0108";
-    const QUBE_FIRMWARE_VERSION: &str = "0.1.7";
-    const QUBE_FIRMWARE_VERSION_BCD: &str = "0x0107";
+    const FIRMWARE_VERSION: &str = "0.1.8";
+    const FIRMWARE_VERSION_BCD: &str = "0x0108";
 
     let vial_path = configured_path("VIAL_JSON_PATH", "vial.json");
     let keyboard_path = configured_path("KEYBOARD_TOML_PATH", "keyboard.toml");
@@ -25,13 +23,8 @@ fn main() {
     validate_keyboard_product_id(&keyboard_path, product_id);
     validate_topology_feature(product_id);
 
-    let (firmware_version, firmware_version_bcd) = if is_standalone(product_id) {
-        (STANDALONE_FIRMWARE_VERSION, STANDALONE_FIRMWARE_VERSION_BCD)
-    } else {
-        (QUBE_FIRMWARE_VERSION, QUBE_FIRMWARE_VERSION_BCD)
-    };
-    println!("cargo:rustc-env=RMK_FIRMWARE_VERSION={firmware_version}");
-    println!("cargo:rustc-env=RMK_FIRMWARE_VERSION_BCD={firmware_version_bcd}");
+    println!("cargo:rustc-env=RMK_FIRMWARE_VERSION={FIRMWARE_VERSION}");
+    println!("cargo:rustc-env=RMK_FIRMWARE_VERSION_BCD={FIRMWARE_VERSION_BCD}");
 
     if is_standalone(product_id) || env::var_os("CARGO_FEATURE_QUBE").is_some() {
         println!("cargo:rustc-env=RMK_VIAL_DEVICE_SETTINGS_FN=crate::layer_names::vial_device_settings");
