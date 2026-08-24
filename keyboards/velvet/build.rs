@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rustc-env=RMK_FIRMWARE_VERSION={FIRMWARE_VERSION}");
     println!("cargo:rustc-env=RMK_FIRMWARE_VERSION_BCD={FIRMWARE_VERSION_BCD}");
     println!("cargo:rustc-env=RMK_VIAL_DEVICE_SETTINGS_FN=crate::velvet_device_settings::vial_device_settings");
+    println!("cargo:rustc-env=RMK_BLE_HOST_POWER_CONFIG_FN=crate::ble_host_power::ble_host_power_config");
 
     generate_vial_config();
 

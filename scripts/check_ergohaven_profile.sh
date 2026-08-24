@@ -556,11 +556,50 @@ for file in keyboards/k04/src/layer_names.rs; do
     fi
     rg -Fq 'const IDX_RESERVED_HOST_DISCONNECT_TIMEOUT: usize = 37;' "$file" \
         || fail "$file: reserved host-timeout storage byte moved"
-    rg -Fq 'fn host_disconnect_timeout_seconds() -> u64 {' "$file" \
-        || fail "$file: fixed K:04 host disconnect policy is missing"
-    rg -Fq '    30 * 60' "$file" \
-        || fail "$file: K:04 host disconnect policy is not fixed at 30 minutes"
 done
+
+host_power_module=keyboards/common/ble_host_power.rs
+rg -Fq 'BleHostPowerConfig::new(' "$host_power_module" \
+    || fail "$host_power_module: shared host BLE power policy is missing"
+rg -Fq 'SPLIT_CENTRAL_SLEEP_TIMEOUT_SECONDS' "$host_power_module" \
+    || fail "$host_power_module: host idle deadline must follow the standalone 120-second sleep contract"
+rg -Fq 'const HOST_DISCONNECT_TIMEOUT_SECONDS: u64 = 30 * 60;' "$host_power_module" \
+    || fail "$host_power_module: host disconnect policy must remain fixed at 30 minutes"
+
+standalone_central_roots=(
+    keyboards/imperial44/src/central.rs
+    keyboards/k03/src/central.rs
+    keyboards/k04/src/central.rs
+    keyboards/op36/src/central.rs
+    keyboards/velvet/src/central.rs
+)
+for file in "${standalone_central_roots[@]}"; do
+    rg -Fq '#[path = "../../common/ble_host_power.rs"]' "$file" \
+        || fail "$file: shared standalone host BLE power module is missing"
+done
+
+standalone_build_scripts=(
+    keyboards/imperial44/build.rs
+    keyboards/k03/build.rs
+    keyboards/k04/build.rs
+    keyboards/op36/build.rs
+    keyboards/velvet/build.rs
+)
+for file in "${standalone_build_scripts[@]}"; do
+    rg -Fq 'RMK_BLE_HOST_POWER_CONFIG_FN=crate::ble_host_power::ble_host_power_config' "$file" \
+        || fail "$file: standalone host BLE power callback is missing"
+done
+rg -Uq 'if is_standalone\(product_id\) \{\n[[:space:]]+println!\("cargo:rustc-env=RMK_BLE_HOST_POWER_CONFIG_FN=crate::ble_host_power::ble_host_power_config"\);\n[[:space:]]+\}' keyboards/k04/build.rs \
+    || fail "keyboards/k04/build.rs: K:04 host BLE power callback must remain Standalone-only"
+if rg -Fq 'RMK_BLE_HOST_POWER_CONFIG_FN' keyboards/classic_qube/build.rs; then
+    fail "keyboards/classic_qube/build.rs: USB Qube must not enable the host BLE power callback"
+fi
+if rg -Fq 'ble_host_power_config' keyboards/k04/src/layer_names.rs; then
+    fail "keyboards/k04/src/layer_names.rs: host BLE power policy must stay in the shared owner"
+fi
+if rg -Fq '../../common/ble_host_power.rs' keyboards/k04/src/qube.rs; then
+    fail "keyboards/k04/src/qube.rs: USB Qube must not include the host BLE power module"
+fi
 
 k04_vial_definitions=(
     keyboards/k04/vial.json

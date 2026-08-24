@@ -30,7 +30,7 @@ fn main() {
         println!("cargo:rustc-env=RMK_VIAL_DEVICE_SETTINGS_FN=crate::layer_names::vial_device_settings");
     }
     if is_standalone(product_id) {
-        println!("cargo:rustc-env=RMK_BLE_HOST_POWER_CONFIG_FN=crate::layer_names::ble_host_power_config");
+        println!("cargo:rustc-env=RMK_BLE_HOST_POWER_CONFIG_FN=crate::ble_host_power::ble_host_power_config");
     }
 
     let out = &PathBuf::from(env::var_os("OUT_DIR").unwrap());

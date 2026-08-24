@@ -3,6 +3,8 @@
 
 mod battery_level;
 mod battery_nrf;
+#[path = "../../common/ble_host_power.rs"]
+mod ble_host_power;
 #[path = "../../common/default_layer_names.rs"]
 mod default_layer_names;
 mod layer_led;

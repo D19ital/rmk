@@ -1,7 +1,7 @@
 use core::str;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use rmk::config::{BleHostPowerConfig, VialDeviceSettings, VialDeviceSettingsData};
+use rmk::config::{VialDeviceSettings, VialDeviceSettingsData};
 use rmk::event::{publish_event, PeripheralSettingsEvent, PeripheralSettingsRefreshEvent};
 use rmk::macros::processor;
 
@@ -155,17 +155,6 @@ pub const fn vial_device_settings() -> VialDeviceSettings<'static> {
         serialize,
         deserialize,
     }
-}
-
-pub fn ble_host_power_config() -> BleHostPowerConfig {
-    BleHostPowerConfig::new(
-        rmk::embassy_time::Duration::from_secs(u64::from(rmk::types::constants::SPLIT_CENTRAL_SLEEP_TIMEOUT_SECONDS)),
-        host_disconnect_timeout_seconds,
-    )
-}
-
-fn host_disconnect_timeout_seconds() -> u64 {
-    30 * 60
 }
 
 pub fn version() -> u8 {

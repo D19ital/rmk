@@ -6,7 +6,7 @@
 
 ### Features
 
-- Added two-stage host BLE power saving for standalone K:04, K:04 Mini, and K:04 Micro, with low-duty parameters after two minutes, a fixed host disconnect after 30 minutes, and fast bonded wake that retains the first input event
+- Added two-stage host BLE power saving to all seven supported Ergohaven standalone profiles—K:03, K:04, K:04 Mini, K:04 Micro, Imperial44, OP36, and Velvet—with low-duty host link parameters after two minutes, a fixed host disconnect after 30 minutes, and fast bonded wake that retains the first supported input event
 - Advertised firmware-native Repeat/Again and Fork key-override capabilities to Entropy for the K:04 Series
 
 ### Improvements
