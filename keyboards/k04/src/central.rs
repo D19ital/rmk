@@ -30,7 +30,7 @@ mod keyboard_central {
         config.max_duty = 20;
         config.sequence_load = ::embassy_nrf::pwm::SequenceLoad::Common;
         let led = ::embassy_nrf::pwm::SequencePwm::new_1ch(p.PWM0, p.P0_30, config).unwrap();
-        crate::layer_led::LayerLed::new(led)
+        crate::layer_led::LayerLed::new(led, 0)
     }
 
     #[register_processor(event)]

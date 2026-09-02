@@ -8,6 +8,8 @@ mod layer_led;
 mod module_settings;
 mod touchpad;
 mod trackball;
+#[cfg(feature = "right_uf2_cleanup")]
+mod uf2_usb_cleanup;
 
 use rmk::macros::rmk_peripheral;
 
@@ -24,7 +26,7 @@ mod keyboard_peripheral {
         config.max_duty = 20;
         config.sequence_load = ::embassy_nrf::pwm::SequenceLoad::Common;
         let led = ::embassy_nrf::pwm::SequencePwm::new_1ch(p.PWM0, p.P0_30, config).unwrap();
-        crate::layer_led::LayerLed::new(led)
+        crate::layer_led::LayerLed::new(led, 1)
     }
 
     #[register_processor(event)]

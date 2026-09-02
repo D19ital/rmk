@@ -2,8 +2,9 @@ use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy, LeSetScanParams};
+use bt_hci::cmd::status::ReadRssi;
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
@@ -17,7 +18,7 @@ use crate::ble::{update_ble_phy, update_conn_params};
 use crate::channel::FLASH_CHANNEL;
 use crate::event::{
     EventSubscriber, PeripheralConnectedEvent, PointingEvent, SleepStateEvent, SplitConnectionState,
-    SplitConnectionStateEvent, SubscribableEvent, publish_event,
+    SplitConnectionStateEvent, SubscribableEvent, publish_event, set_current_split_connection_state,
 };
 #[cfg(feature = "storage")]
 use crate::split::ble::PeerAddress;
@@ -60,6 +61,8 @@ const POINTING_ACTIVITY_THRESHOLD: u16 = 2;
 const SPLIT_SERVICE_UUID: [u8; 16] = [70, 153, 101, 152, 54, 53, 10, 191, 7, 75, 229, 24, 170, 251, 213, 77];
 const SPLIT_COMPANY_ID: u16 = 0xe118;
 const VALIDATED_PEER_FAILURE_LIMIT: u8 = 3;
+#[cfg(feature = "rtt_diag")]
+const SPLIT_RSSI_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailedPeerAction {
@@ -195,6 +198,11 @@ fn publish_peripheral_connection(id: usize, connected: bool) {
 }
 
 fn publish_split_connection_state(state: SplitConnectionState, generation: u32, terminal: bool) {
+    set_current_split_connection_state(state);
+    info!(
+        "[SPLIT_STATE_L_V15] state={:?} generation={} terminal={}",
+        state, generation, terminal
+    );
     publish_event(SplitConnectionStateEvent(state));
     if terminal {
         SPLIT_WINDOW_DONE.signal(generation);
@@ -567,7 +575,8 @@ pub(crate) async fn run_ble_peripheral_manager<
     C: Controller
         + ControllerCmdSync<LeSetScanParams>
         + ControllerCmdAsync<LeSetPhy>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<ReadRssi>,
     const ROW: usize,
     const COL: usize,
     const ROW_OFFSET: usize,
@@ -739,7 +748,10 @@ async fn validate_split_product<T: SplitReader + SplitWriter>(driver: &mut T) ->
 async fn run_central_manager_task<
     'b,
     's: 'b,
-    C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+    C: Controller
+        + ControllerCmdAsync<LeSetPhy>
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<ReadRssi>,
     P: PacketPool,
     const ROW: usize,
     const COL: usize,
@@ -762,17 +774,55 @@ async fn run_central_manager_task<
     let active_profile = effective_split_link_profile(id, profile);
     update_conn_params(stack, conn, &active_central_conn_param(active_profile)).await;
 
-    match select3(
+    match select4(
         ble_central_task(&client, conn),
         run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(id, peer_address, &client, peer_validated),
         follow_sleep_state(stack, conn, id, profile),
+        log_split_rssi(stack, conn, id),
     )
     .await
     {
-        Either3::First(e) => e,
-        Either3::Second(e) => e,
-        Either3::Third(e) => e,
+        Either4::First(e) => e,
+        Either4::Second(e) => e,
+        Either4::Third(e) => e,
+        Either4::Fourth(e) => e,
     }
+}
+
+#[cfg(feature = "rtt_diag")]
+async fn log_split_rssi<'b, 's: 'b, C, P>(
+    stack: &'b Stack<'s, C, P>,
+    conn: &Connection<'b, P>,
+    peripheral_id: usize,
+) -> Result<(), BleHostError<C::Error>>
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+    P: PacketPool,
+{
+    loop {
+        Timer::after(SPLIT_RSSI_INTERVAL).await;
+        match conn.rssi(stack).await {
+            Ok(rssi) => info!("[SPLIT_RSSI] side=L id={} rssi_dbm={}", peripheral_id, rssi),
+            Err(e) => {
+                #[cfg(feature = "defmt")]
+                let e = defmt::Debug2Format(&e);
+                warn!("[SPLIT_RSSI] side=L id={} read_error={:?}", peripheral_id, e);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "rtt_diag"))]
+async fn log_split_rssi<'b, 's: 'b, C, P>(
+    _stack: &'b Stack<'s, C, P>,
+    _conn: &Connection<'b, P>,
+    _peripheral_id: usize,
+) -> Result<(), BleHostError<C::Error>>
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+    P: PacketPool,
+{
+    core::future::pending().await
 }
 
 async fn ble_central_task<'a, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(
@@ -889,7 +939,11 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Sp
         trace!("Received split message: {:?}", message);
 
         match &message {
-            SplitMessage::Pointing(event) => update_pointing_activity_time(event),
+            SplitMessage::Pointing(event) => {
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_split_rx(event);
+                update_pointing_activity_time(event);
+            }
             SplitMessage::Key(_) => report_activity(),
             _ => {}
         }

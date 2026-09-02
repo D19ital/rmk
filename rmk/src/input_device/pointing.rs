@@ -1181,8 +1181,8 @@ fn qube_divided_motion(state: &mut QubePointingSideState, x: i16, y: i16, diviso
     state.remainder_x -= out_x * divisor;
     state.remainder_y -= out_y * divisor;
     (
-        out_x.clamp(i8::MIN as i32, i8::MAX as i32) as i16,
-        out_y.clamp(i8::MIN as i32, i8::MAX as i32) as i16,
+        out_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        out_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
     )
 }
 
@@ -1263,14 +1263,32 @@ async fn send_mouse_report(source_buttons: u8, buttons: u8, x: i16, y: i16, whee
 }
 
 async fn send_mouse_report_unchecked(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
-    send_hid_report(Report::MouseReport(MouseReport {
-        buttons,
-        x: x.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-        y: y.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-        wheel: wheel.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-        pan: pan.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-    }))
-    .await;
+    let mut x = i32::from(x);
+    let mut y = i32::from(y);
+    let mut wheel = i32::from(wheel);
+    let mut pan = i32::from(pan);
+
+    loop {
+        let has_relative_motion = x != 0 || y != 0 || wheel != 0 || pan != 0;
+        let (chunk_x, chunk_y, chunk_wheel, chunk_pan) = if has_relative_motion {
+            crate::mouse_chunk::take_vector_chunk(&mut x, &mut y, &mut wheel, &mut pan)
+        } else {
+            (0, 0, 0, 0)
+        };
+
+        send_hid_report(Report::MouseReport(MouseReport {
+            buttons,
+            x: chunk_x,
+            y: chunk_y,
+            wheel: chunk_wheel,
+            pan: chunk_pan,
+        }))
+        .await;
+
+        if x == 0 && y == 0 && wheel == 0 && pan == 0 {
+            break;
+        }
+    }
 }
 
 /// PointingProcessor that converts motion events to mouse reports

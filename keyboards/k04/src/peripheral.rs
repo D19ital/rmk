@@ -7,6 +7,8 @@ mod layer_led;
 mod module_settings;
 mod touchpad;
 mod trackball;
+#[cfg(feature = "right_uf2_cleanup")]
+mod uf2_usb_cleanup;
 
 use rmk::macros::rmk_peripheral;
 
@@ -23,7 +25,7 @@ mod keyboard_peripheral {
         config.max_duty = 20;
         config.sequence_load = ::embassy_nrf::pwm::SequenceLoad::Common;
         let led = ::embassy_nrf::pwm::SequencePwm::new_1ch(p.PWM0, p.P0_30, config).unwrap();
-        crate::layer_led::LayerLed::new(led)
+        crate::layer_led::LayerLed::new(led, 1)
     }
 
     #[register_processor(event)]
@@ -37,6 +39,12 @@ mod keyboard_peripheral {
             crate::trackball::new_trackball_from_pins(1, p.P0_01, p.P0_00, p.P0_05, p.P1_09),
             1,
         )
+    }
+
+    #[cfg(feature = "rtt_diag")]
+    #[register_processor(event)]
+    fn rtt_scheduler_probe() -> crate::trackball::RttSchedulerProbe {
+        crate::trackball::RttSchedulerProbe::new()
     }
 
     #[register_processor(event)]

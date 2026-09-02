@@ -30,6 +30,7 @@ const FRAME_WORDS: usize = LED_COUNT * 24 + RESET_SLOTS;
 )]
 pub struct LayerLed {
     led: SequencePwm<'static>,
+    side: u8,
     current_layer: Option<u8>,
     current_color: Option<Rgb>,
     split_state: SplitConnectionState,
@@ -37,20 +38,23 @@ pub struct LayerLed {
     phase_started: Instant,
     connected_until: Option<Instant>,
     latest_battery: Option<u8>,
+    last_vbus_status: Option<(bool, bool)>,
 }
 
 impl LayerLed {
-    pub fn new(led: SequencePwm<'static>) -> Self {
+    pub fn new(led: SequencePwm<'static>, side: u8) -> Self {
         let now = Instant::now();
         Self {
             led,
+            side,
             current_layer: Some(0),
             current_color: None,
-            split_state: SplitConnectionState::Searching,
+            split_state: rmk::event::current_split_connection_state(),
             sleeping: false,
             phase_started: now,
             connected_until: None,
             latest_battery: None,
+            last_vbus_status: None,
         }
     }
 
@@ -60,13 +64,7 @@ impl LayerLed {
     }
 
     async fn on_split_connection_state_event(&mut self, event: SplitConnectionStateEvent) {
-        if self.split_state != event.0 {
-            let now = Instant::now();
-            self.split_state = event.0;
-            self.phase_started = now;
-            self.connected_until = (event.0 == SplitConnectionState::Connected)
-                .then(|| now + Duration::from_millis(CONNECTED_INDICATOR_MS));
-        }
+        self.apply_split_state(event.0, Instant::now(), 0);
         self.render(Instant::now()).await;
     }
 
@@ -92,44 +90,85 @@ impl LayerLed {
     }
 
     async fn render(&mut self, now: Instant) {
-        let color = self.display_color(now);
+        // Reconcile from the sticky snapshot in case Connected was published
+        // before this processor installed its event subscription.
+        self.apply_split_state(rmk::event::current_split_connection_state(), now, 1);
+
+        let vbus_status = crate::battery_nrf::usb_power_status();
+        if self.last_vbus_status != Some(vbus_status) {
+            self.last_vbus_status = Some(vbus_status);
+            defmt::info!(
+                "[VBUS_Q_V17] side={} vbus={} outputrdy={} effective={}",
+                self.side,
+                vbus_status.0,
+                vbus_status.1,
+                vbus_status.0
+            );
+        }
+
+        let (color, reason) = self.display_color(now, vbus_status);
         if self.current_color == Some(color) {
             return;
         }
         self.current_color = Some(color);
+        defmt::info!(
+            "[LED_Q_V15] side={} reason={} split={:?} rgb=({},{},{})",
+            self.side,
+            reason,
+            self.split_state,
+            color.r,
+            color.g,
+            color.b
+        );
         send_color(&mut self.led, color).await;
     }
 
-    fn display_color(&self, now: Instant) -> Rgb {
-        if self.current_layer == Some(0)
-            && crate::battery_nrf::usb_powered()
-            && module_settings::charge_indicator_enabled()
-        {
-            return if self.latest_battery.is_some_and(|level| level >= CHARGED_BATTERY_MIN) {
-                color_green()
-            } else {
-                color_yellow()
-            };
+    fn apply_split_state(&mut self, state: SplitConnectionState, now: Instant, source: u8) {
+        if self.split_state == state {
+            return;
         }
+        self.split_state = state;
+        self.phase_started = now;
+        self.connected_until =
+            (state == SplitConnectionState::Connected).then(|| now + Duration::from_millis(CONNECTED_INDICATOR_MS));
+        defmt::info!(
+            "[SPLIT_LED_Q_V15] side={} source={} state={:?}",
+            self.side,
+            source,
+            state
+        );
+    }
 
+    fn display_color(&self, now: Instant, vbus_status: (bool, bool)) -> (Rgb, u8) {
         if self.sleeping || self.split_state == SplitConnectionState::Idle {
-            return color_off();
+            return (color_off(), 0);
         }
 
+        // Split acquisition is more important than charging status. USB power
+        // must not turn the post-UF2 searching blink into a misleading solid
+        // yellow indication.
         if self.split_state == SplitConnectionState::Searching {
             let elapsed_ms = now.duration_since(self.phase_started).as_millis();
             return if elapsed_ms % SPLIT_BLINK_PERIOD_MS < SPLIT_BLINK_ON_MS {
-                color_yellow()
+                (color_yellow(), 1)
             } else {
-                color_off()
+                (color_off(), 1)
             };
         }
 
         if self.connected_until.is_some_and(|until| now < until) {
-            return color_green();
+            return (color_green(), 2);
         }
 
-        self.current_layer.map(color_for_layer).unwrap_or_else(color_off)
+        if self.current_layer == Some(0) && vbus_status.0 && module_settings::charge_indicator_enabled() {
+            return if self.latest_battery.is_some_and(|level| level >= CHARGED_BATTERY_MIN) {
+                (color_green(), 3)
+            } else {
+                (color_yellow(), 3)
+            };
+        }
+
+        (self.current_layer.map(color_for_layer).unwrap_or_else(color_off), 4)
     }
 }
 

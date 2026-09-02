@@ -116,7 +116,7 @@ impl<'a, 'd, D: Driver<'d>> UsbKeyboardWriter<'a, 'd, D> {
         loop {
             let report = USB_REPORT_CHANNEL.receive().await;
 
-            if let Some(Err(e)) = write_while_usb_configured(self.write_report(&report)).await {
+            if let Some(Err(e)) = write_while_usb_configured(self.write_report(report.report())).await {
                 error!("Failed to send report: {:?}", e);
             }
         }

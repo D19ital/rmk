@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## v0.1.9-rc.1
+
+Release candidate for the standalone K:04 Series: K:04, K:04 Mini, and K:04 Micro. K:04 Qube profiles and all other keyboards remain on v0.1.8.
+
+The embedded Vial definition carries the full `0.1.9-rc.1` identity. VIA and USB fields that support only numeric versions advertise `0.1.9` / `0x0109`.
+
+### Features
+
+- Added the `production_v22` build profile for all six standalone K:04 Series half images, with diagnostic features excluded at compile time and release symbols stripped
+- Added accumulated full-width `i16` motion transport from the right half so lowering the split report rate never discards trackball distance
+- Added generation-aware split lifecycle state and recovery so the left half can reset, tear down stale resources, and reconnect to the still-running right half
+- Added gated RTT instrumentation and regression helpers for split timing, HID queues, PMW3610 health, radio strength, USB state, and movement preservation; none are enabled in production images
+
+### Improvements
+
+- Set right-half motion reports to 15 ms, exactly two 7.5 ms split radio windows, while retaining 4 ms local trackball sampling
+- Paced BLE HID mouse reports at 7.5 ms and merged queued relative motion with proportional vector-preserving chunking, retaining button ordering and total movement
+- Configured the K:04 Series radio for +8 dBm and 1M PHY, and enabled the E73 REG1 DC/DC path with REG0 disabled
+- Configured PMW3610 for 600 CPI, Smart Mode, software axis swapping, and verified register setup on K:04, Mini, and Micro
+- Refreshed bonded-host connection parameters through an Apple-compatible 15 ms request followed by 7.5 ms when accepted, with a 15 ms/latency-zero fallback
+- Preserved the v0.1.8 two-minute sleep timeout and host power policy
+
+### Fixes
+
+- Removed the persistent right-trackball latency caused by sending split movement faster than the BLE link could drain its notification queue
+- Reduced weak-signal right-trackball microfreezes without clipping or losing accumulated motion
+- Recovered PMW3610 from failed or implausible reads and added fallback reads after motion gaps
+- Fixed split recovery after resetting the left half, including stale channel/resource cleanup and advertising/HCI race handling
+- Cleared stale USB, POWER, and NVIC state left by the UF2 bootloader on the right half so disconnecting USB cannot leave it locked up
+- Corrected VBUS/charging indication and made live split-searching state take priority over stale connected LED state
+
+### Verification
+
+- Passed all four motion pacing and movement-preservation tests, the RMK feature test matrix, and production builds for both halves of K:04, K:04 Mini, and K:04 Micro
+- Validated all six UF2 images as nRF52840 firmware starting at `0x00026000`
+- Physically validated K:04 right-trackball behavior at 20 cm and 60 cm; K:04 Mini and K:04 Micro still require model-specific hardware regression testing
+
 ## v0.1.8
 
 ### Features

@@ -124,7 +124,12 @@ async fn manage_sleep_state(idle_timeout: Duration) -> ! {
         loop {
             match select(SLEEP_INPUT.wait(), Timer::after(idle_timeout)).await {
                 Either::First(true) | Either::Second(_) => break,
-                Either::First(false) => debug!("Activity detected, resetting sleep timeout"),
+                Either::First(false) => {
+                    #[cfg(feature = "rtt_diag")]
+                    trace!("Activity detected, resetting sleep timeout");
+                    #[cfg(not(feature = "rtt_diag"))]
+                    debug!("Activity detected, resetting sleep timeout");
+                }
             }
         }
 

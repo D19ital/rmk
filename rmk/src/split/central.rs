@@ -6,6 +6,7 @@ use embedded_io_async::{Read, Write};
 #[cfg(feature = "_ble")]
 use {
     bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeSetPhy, LeSetScanParams},
+    bt_hci::cmd::status::ReadRssi,
     bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync},
     heapless::VecView,
     trouble_host::prelude::*,
@@ -33,7 +34,8 @@ pub async fn run_peripheral_manager<
     #[cfg(feature = "_ble")] C: Controller
         + ControllerCmdSync<LeSetScanParams>
         + ControllerCmdAsync<LeSetPhy>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<ReadRssi>,
     #[cfg(not(feature = "_ble"))] S: Read + Write,
 >(
     id: usize,
@@ -79,7 +81,8 @@ pub async fn run_peripheral_manager_with_profile<
     C: Controller
         + ControllerCmdSync<LeSetScanParams>
         + ControllerCmdAsync<LeSetPhy>
-        + ControllerCmdSync<LeReadLocalSupportedFeatures>,
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<ReadRssi>,
 >(
     id: usize,
     addr: &RefCell<VecView<Option<[u8; 6]>>>,

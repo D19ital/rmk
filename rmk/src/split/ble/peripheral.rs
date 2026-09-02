@@ -1,6 +1,10 @@
 use bt_hci::cmd::le::LeSetPhy;
-use bt_hci::controller::ControllerCmdAsync;
+use bt_hci::cmd::status::ReadRssi;
+use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::join::join;
+use embassy_futures::select::{Either, select};
+#[cfg(feature = "rtt_diag")]
+use embassy_time::Instant;
 use embassy_time::{Duration, Timer, with_timeout};
 use rmk_types::connection::ConnectionStatus;
 use trouble_host::prelude::*;
@@ -10,6 +14,7 @@ use super::PeerAddress;
 use crate::ble::sleep::wait_for_input_activity;
 use crate::event::{
     CentralConnectedEvent, SleepStateEvent, SplitConnectionState, SplitConnectionStateEvent, publish_event,
+    set_current_split_connection_state,
 };
 use crate::split::driver::{SplitDriverError, SplitReader, SplitWriter};
 use crate::split::peripheral::SplitPeripheral;
@@ -17,6 +22,16 @@ use crate::split::{SPLIT_MESSAGE_MAX_SIZE, SplitMessage, encode_split_message};
 use crate::state::update_status;
 
 const SPLIT_COMPANY_ID: u16 = 0xe118;
+#[cfg(feature = "rtt_diag")]
+const SPLIT_RSSI_INTERVAL: Duration = Duration::from_secs(1);
+const DIRECTED_SPLIT_RECONNECT_SECS: u64 = 2;
+const SPLIT_ADVERTISING_RELEASE_GUARD_MS: u64 = 100;
+
+fn publish_peripheral_split_state(id: usize, state: SplitConnectionState) {
+    set_current_split_connection_state(state);
+    info!("[SPLIT_STATE_R_V15] id={} state={:?}", id, state);
+    publish_event(SplitConnectionStateEvent(state));
+}
 
 /// Gatt service used in split peripheral to send split message to central
 #[gatt_service(uuid = "4dd5fbaa-18e5-4b07-bf0a-353698659946")]
@@ -122,13 +137,19 @@ impl<'stack, 'server, 'c, P: PacketPool> SplitWriter for BleSplitPeripheralDrive
         // Pointing messages can run at 125 Hz. Keep per-packet diagnostics at
         // trace level so USB logging cannot stall the split transport.
         trace!("Writing split message to central: {:?}", message);
-        self.message_to_central
-            .notify_raw(self.conn, encoded, false)
-            .await
-            .map_err(|e| {
-                error!("BLE notify error: {:?}", e);
-                SplitDriverError::BleError(1)
-            })?;
+        #[cfg(feature = "rtt_diag")]
+        let diag_started = Instant::now();
+        let result = self.message_to_central.notify_raw(self.conn, encoded, false).await;
+        #[cfg(feature = "rtt_diag")]
+        crate::rtt_diag::record_split_tx(
+            message,
+            Instant::now().duration_since(diag_started).as_micros() as u32,
+            result.is_ok(),
+        );
+        result.map_err(|e| {
+            error!("BLE notify error: {:?}", e);
+            SplitDriverError::BleError(1)
+        })?;
         Ok(encoded.len())
     }
 }
@@ -140,12 +161,17 @@ impl<'stack, 'server, 'c, P: PacketPool> SplitWriter for BleSplitPeripheralDrive
 /// * `id` - The id of the peripheral
 /// * `central_addr` - The address of the central
 /// * `stack` - The stack to use
-pub async fn initialize_nrf_ble_split_peripheral_and_run<'b, 's: 'b, C: Controller + ControllerCmdAsync<LeSetPhy>>(
+pub async fn initialize_nrf_ble_split_peripheral_and_run<
+    'b,
+    's: 'b,
+    C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<ReadRssi>,
+>(
     id: usize,
     stack: &'b Stack<'s, C, DefaultPacketPool>,
 ) {
     publish_event(CentralConnectedEvent { connected: false });
-    publish_event(SplitConnectionStateEvent(SplitConnectionState::Searching));
+    publish_peripheral_split_state(id, SplitConnectionState::Searching);
+    info!("[BOOT_R_V15] id={} split_task=started", id);
 
     let mut peripheral = stack.peripheral();
     let runner = stack.runner();
@@ -165,7 +191,7 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<'b, 's: 'b, C: Controll
         loop {
             update_status(|c| *c = ConnectionStatus::new());
             publish_event(CentralConnectedEvent { connected: false });
-            publish_event(SplitConnectionStateEvent(SplitConnectionState::Searching));
+            publish_peripheral_split_state(id, SplitConnectionState::Searching);
             match split_peripheral_advertise(id, central_addr, &mut peripheral, &server).await {
                 Ok((conn, allow_rebind)) => {
                     info!("Connected to the split central");
@@ -186,7 +212,7 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<'b, 's: 'b, C: Controll
                     }
 
                     publish_event(CentralConnectedEvent { connected: true });
-                    publish_event(SplitConnectionStateEvent(SplitConnectionState::Connected));
+                    publish_peripheral_split_state(id, SplitConnectionState::Connected);
                     if !central_saved || central_addr != Some(new_addr) {
                         info!("Saving validated split central address to storage");
                         if crate::storage::write_peer_address(PeerAddress {
@@ -201,12 +227,21 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<'b, 's: 'b, C: Controll
                         }
                     }
                     let mut peripheral = SplitPeripheral::new(split_driver);
-                    peripheral.run().await;
+                    match select(peripheral.run(), log_split_rssi(stack, conn.raw(), id)).await {
+                        Either::First(_) => {
+                            info!("[SPLIT_RECOVERY_V19] side=R id={} source=transport", id);
+                        }
+                        Either::Second(result) => {
+                            #[cfg(feature = "defmt")]
+                            let result = defmt::Debug2Format(&result);
+                            warn!("[SPLIT_RECOVERY_V19] side=R id={} source=rssi result={:?}", id, result);
+                        }
+                    }
                     info!("Disconnected from the split central");
                 }
                 Err(BleHostError::BleHost(Error::Timeout)) => {
                     error!("Connect to split central timeout");
-                    publish_event(SplitConnectionStateEvent(SplitConnectionState::Idle));
+                    publish_peripheral_split_state(id, SplitConnectionState::Idle);
                     publish_event(SleepStateEvent::new(true));
 
                     wait_for_input_activity().await;
@@ -226,6 +261,60 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<'b, 's: 'b, C: Controll
     };
 
     join(ble_task(runner), peri_task).await;
+}
+
+#[cfg(feature = "rtt_diag")]
+async fn log_split_rssi<'b, 's: 'b, C, P>(
+    stack: &'b Stack<'s, C, P>,
+    conn: &Connection<'b, P>,
+    peripheral_id: usize,
+) -> Result<(), BleHostError<C::Error>>
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+    P: PacketPool,
+{
+    const FAILURE_LIMIT: u8 = 2;
+    let mut consecutive_failures = 0u8;
+    loop {
+        Timer::after(SPLIT_RSSI_INTERVAL).await;
+        match conn.rssi(stack).await {
+            Ok(rssi) => {
+                consecutive_failures = 0;
+                info!("[SPLIT_RSSI] side=R id={} rssi_dbm={}", peripheral_id, rssi);
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                #[cfg(feature = "defmt")]
+                warn!(
+                    "[SPLIT_RSSI] side=R id={} read_error={:?} failure={}/{}",
+                    peripheral_id,
+                    defmt::Debug2Format(&e),
+                    consecutive_failures,
+                    FAILURE_LIMIT
+                );
+                // A reset central can leave the GATT runner waiting longer
+                // than the controller's RSSI command. Treat two consecutive
+                // failures as authoritative link loss so one transient
+                // controller collision cannot flap a healthy connection.
+                if consecutive_failures >= FAILURE_LIMIT {
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "rtt_diag"))]
+async fn log_split_rssi<'b, 's: 'b, C, P>(
+    _stack: &'b Stack<'s, C, P>,
+    _conn: &Connection<'b, P>,
+    _peripheral_id: usize,
+) -> Result<(), BleHostError<C::Error>>
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+    P: PacketPool,
+{
+    core::future::pending().await
 }
 
 async fn validate_split_central<T: SplitReader + SplitWriter>(driver: &mut T) -> bool {
@@ -289,6 +378,10 @@ async fn split_peripheral_advertise<'a, 'b, C: Controller>(
             }
             Err(_) => {
                 warn!("[adv] directed split reconnect timeout, falling back to discoverable advertising");
+                // Cancelling advertiser.accept() does not guarantee that
+                // nrf-sdc has already released the advertising set. Avoid a
+                // second advertising command on that teardown boundary.
+                Timer::after_millis(SPLIT_ADVERTISING_RELEASE_GUARD_MS).await;
             }
         }
     }
@@ -324,7 +417,11 @@ fn split_advertising_windows(has_saved_central: bool, configured_timeout_secs: u
     }
 
     let total = u64::from(configured_timeout_secs);
-    let directed = if has_saved_central { total.min(10) } else { 0 };
+    let directed = if has_saved_central {
+        total.min(DIRECTED_SPLIT_RECONNECT_SECS)
+    } else {
+        0
+    };
     (directed, total.saturating_sub(directed), 0)
 }
 
@@ -400,7 +497,7 @@ mod tests {
 
     #[test]
     fn configured_split_timeout_is_one_total_window() {
-        assert_eq!(split_advertising_windows(true, 30), (10, 20, 0));
+        assert_eq!(split_advertising_windows(true, 30), (2, 28, 0));
         assert_eq!(split_advertising_windows(false, 30), (0, 30, 0));
     }
 

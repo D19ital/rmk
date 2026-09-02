@@ -68,7 +68,8 @@ pub use input::{
 #[cfg(feature = "split")]
 pub use split::{
     CentralConnectedEvent, PeripheralConnectedEvent, PeripheralSettingsEvent, PeripheralSettingsRefreshEvent,
-    SplitConnectionState, SplitConnectionStateEvent,
+    SplitConnectionState, SplitConnectionStateEvent, current_split_connection_state,
+    set_current_split_connection_state,
 };
 #[cfg(all(feature = "split", feature = "_ble"))]
 pub use split::{ClearPeerEvent, PeripheralBatteryEvent, PeripheralBatteryRefreshEvent};

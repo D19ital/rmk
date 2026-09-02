@@ -121,8 +121,37 @@ impl<const CACHE_HOST_STATUS: bool> BatteryReader<CACHE_HOST_STATUS> {
     }
 }
 
+/// Raw nRF USB regulator status used by the v15 startup/LED diagnostics.
+pub(crate) fn usb_power_status() -> (bool, bool) {
+    let status = embassy_nrf::pac::POWER.usbregstatus().read();
+    (status.vbusdetect(), status.outputrdy())
+}
+
 pub(crate) fn usb_powered() -> bool {
-    embassy_nrf::pac::POWER.usbregstatus().read().vbusdetect()
+    // Restore the v14 charging semantics. On the split peripheral OUTPUTRDY
+    // may remain low after the v16 bootloader-USBD cleanup even though VBUS is
+    // physically present. VBUSDETECT is the authoritative cable signal; the
+    // v16 cleanup removes the stale UF2 interrupt state that originally made
+    // the right-side indication misleading.
+    usb_power_status().0
+}
+
+/// Repeated briefly after boot so an RTT client attached after UF2 can verify
+/// that no bootloader-owned USB interrupt source remains on the right half.
+#[cfg(feature = "right_uf2_cleanup")]
+pub(crate) fn log_uf2_usb_cleanup_state_v16() {
+    let power = embassy_nrf::pac::POWER;
+    let usbd = embassy_nrf::pac::USBD;
+    let usb = power.usbregstatus().read();
+    defmt::info!(
+        "[UF2_USB_CLEANUP_V16] usbd_en={} usbd_int=0x{:08x} power_usb_int=0x{:03x} vbus={} outputrdy={} resetreas=0x{:08x}",
+        usbd.enable().read().enable(),
+        usbd.inten().read().0,
+        power.intenset().read().0 & 0x380,
+        usb.vbusdetect(),
+        usb.outputrdy(),
+        power.resetreas().read().0
+    );
 }
 
 fn current_charge_state() -> ChargeState {

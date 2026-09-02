@@ -16,6 +16,18 @@ default = ["standalone"]
 standalone = ["rmk/defmt"]
 usb_debug = ["rmk/usb_log"]
 usb_debug_force_ble = ["usb_debug"]
+rtt_diag = ["rmk/rtt_diag"]
+mouse_interval_control = ["rmk/mouse_interval_control"]
+mouse_vector_preserve = ["mouse_interval_control", "rmk/mouse_vector_preserve"]
+host_fixed_15ms = ["rtt_diag", "rmk/host_fixed_15ms"]
+pmw_axes_600 = []
+production_v22 = ["mouse_vector_preserve", "pmw_axes_600", "right_uf2_cleanup"]
+pmw_force_awake_diag = ["mouse_interval_control", "rtt_diag"]
+pmw_smart_off_diag = ["mouse_interval_control", "rtt_diag"]
+pmw_raw_600_diag = ["mouse_interval_control", "rtt_diag"]
+pmw_raw_1000_diag = ["mouse_interval_control", "rtt_diag"]
+pmw_axes_600_diag = ["mouse_vector_preserve", "pmw_axes_600", "rtt_diag"]
+right_uf2_cleanup = []
 # Qube dongle ST7789 UI (only for --bin qube).
 qube = [
     "rmk/usb_log",
@@ -26,9 +38,9 @@ qube = [
     "dep:rmk-types",
     "dep:u8g2-fonts",
 ]
-# Preserve the former Qube-half build feature set without enabling USB logging
-# in standalone K:04 firmware.
-qube-half = ["rmk/usb_log"]
+# Diagnostic Qube halves use RTT/defmt. Enabling usb_log at the same time asks
+# trouble-host for mutually exclusive `log` and `defmt` backends.
+qube-half = ["rmk/defmt"]
 
 [dependencies]
 rmk = { path = "../../rmk", default-features = false, features = [
@@ -139,10 +151,11 @@ panic = "unwind"
 
 [profile.release]
 codegen-units = 1
-debug = true
+debug = false
 opt-level = "z"
 overflow-checks = false
 lto = "fat"
+strip = "symbols"
 
 # Prevent cargo from looking for a workspace above this directory
 [workspace]

@@ -167,6 +167,7 @@ impl MaxSize for FirmwareChunkData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{Axis, AxisEvent, AxisValType};
 
     #[test]
     fn split_encoder_returns_only_the_serialized_prefix() {
@@ -179,6 +180,41 @@ mod tests {
         assert!(encoded.len() < capacity);
         match postcard::from_bytes::<SplitMessage>(encoded).unwrap() {
             SplitMessage::Key(event) => assert_eq!(event, KeyboardEvent::key(2, 3, true)),
+            _ => panic!("decoded the wrong split-message variant"),
+        }
+    }
+
+    #[test]
+    fn split_pointing_round_trip_preserves_full_i16_axes() {
+        let message = SplitMessage::Pointing(PointingEvent {
+            device_id: 1,
+            axes: [
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::X,
+                    value: i16::MIN,
+                },
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::Y,
+                    value: i16::MAX,
+                },
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::Z,
+                    value: 0,
+                },
+            ],
+        });
+        let mut buffer = [0_u8; SPLIT_MESSAGE_MAX_SIZE];
+        let encoded = encode_split_message(&message, &mut buffer).unwrap();
+
+        match postcard::from_bytes::<SplitMessage>(encoded).unwrap() {
+            SplitMessage::Pointing(event) => {
+                assert_eq!(event.axes[0].value, i16::MIN);
+                assert_eq!(event.axes[1].value, i16::MAX);
+                assert_eq!(event.axes[2].value, 0);
+            }
             _ => panic!("decoded the wrong split-message variant"),
         }
     }

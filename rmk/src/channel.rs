@@ -6,6 +6,7 @@ use embassy_sync::channel::{Channel, TrySendError};
 #[cfg(any(feature = "_ble", all(feature = "storage", feature = "host")))]
 use embassy_sync::signal::Signal;
 pub use embassy_sync::{blocking_mutex, channel, pubsub, zerocopy_channel};
+use embassy_time::Instant;
 use rmk_types::connection::ConnectionType;
 #[cfg(feature = "_ble")]
 use {
@@ -22,7 +23,39 @@ use crate::hid::{KeyboardReport, Report};
 use crate::{FLASH_CHANNEL_SIZE, storage::FlashOperationMessage};
 use crate::{REPORT_CHANNEL_SIZE, RawMutex};
 
-type ReportChannel = Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>;
+/// One HID report together with the instant at which its producer entered the
+/// transport path. The timestamp lets RTT diagnostics measure motion age at
+/// the actual BLE notification rather than inferring it from queue length.
+#[derive(Debug)]
+pub struct QueuedReport {
+    report: Report,
+    enqueued_at: Instant,
+}
+
+impl QueuedReport {
+    pub(crate) fn new(report: Report) -> Self {
+        Self {
+            report,
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    /// Returns the wrapped HID report without consuming the queue item.
+    pub fn report(&self) -> &Report {
+        &self.report
+    }
+
+    /// Consumes the queue item and returns its wrapped HID report.
+    pub fn into_report(self) -> Report {
+        self.report
+    }
+
+    pub(crate) fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
+}
+
+type ReportChannel = Channel<RawMutex, QueuedReport, REPORT_CHANNEL_SIZE>;
 
 /// Signal for LED indicator, used in BLE keyboards only since BLE receiving is not async
 #[cfg(feature = "_ble")]
@@ -70,19 +103,55 @@ fn report_destination() -> Option<(ConnectionType, &'static ReportChannel)> {
 /// During BLE idle sleep, reports are retained in the BLE queue. This lets the
 /// keyboard processor handle the wake key's release and subsequent input while
 /// the transport reconnects; the new BLE writer drains the ordered reports.
-pub async fn send_hid_report(mut report: Report) {
+pub async fn send_hid_report(report: Report) {
     let Some((transport, ch)) = report_destination() else {
         return;
     };
 
+    #[cfg(feature = "rtt_diag")]
+    let diag_started = Instant::now();
+    #[cfg(feature = "rtt_diag")]
+    let diag_is_mouse = matches!(&report, Report::MouseReport(_));
+    #[cfg(feature = "rtt_diag")]
+    let mut diag_full_retries = 0u32;
+    let mut queued_report = QueuedReport::new(report);
+
     loop {
-        match ch.try_send(report) {
-            Ok(()) => return,
-            Err(TrySendError::Full(r)) => report = r,
+        match ch.try_send(queued_report) {
+            Ok(()) => {
+                #[cfg(feature = "rtt_diag")]
+                if matches!(transport, ConnectionType::Ble) {
+                    crate::rtt_diag::record_hid_enqueue(
+                        diag_is_mouse,
+                        ch.len(),
+                        diag_full_retries,
+                        Instant::now().duration_since(diag_started).as_micros() as u32,
+                        true,
+                    );
+                }
+                return;
+            }
+            Err(TrySendError::Full(r)) => {
+                queued_report = r;
+                #[cfg(feature = "rtt_diag")]
+                {
+                    diag_full_retries = diag_full_retries.saturating_add(1);
+                }
+            }
         }
 
         poll_fn(|cx| ch.poll_ready_to_send(cx)).await;
         if crate::state::active_transport() != Some(transport) {
+            #[cfg(feature = "rtt_diag")]
+            if matches!(transport, ConnectionType::Ble) {
+                crate::rtt_diag::record_hid_enqueue(
+                    diag_is_mouse,
+                    ch.len(),
+                    diag_full_retries,
+                    Instant::now().duration_since(diag_started).as_micros() as u32,
+                    false,
+                );
+            }
             return;
         }
     }
@@ -93,7 +162,7 @@ pub async fn send_hid_report(mut report: Report) {
 /// the matrix scan (e.g. steno chord output).
 pub(crate) fn try_send_hid_report(report: Report) {
     if let Some((_, ch)) = active_report_channel() {
-        let _ = ch.try_send(report);
+        let _ = ch.try_send(QueuedReport::new(report));
     }
 }
 
@@ -103,7 +172,7 @@ pub(crate) fn try_send_hid_report(report: Report) {
 pub(crate) fn clear_and_release_report_channel(transport: ConnectionType) {
     if let Some(ch) = report_channel(transport) {
         ch.clear();
-        let _ = ch.try_send(Report::KeyboardReport(KeyboardReport::default()));
+        let _ = ch.try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport::default())));
     }
 }
 
