@@ -21,7 +21,7 @@ use crate::codegen::input_device::encoder::expand_encoder_device;
 use crate::codegen::input_device::iqs5xx::{expand_iqs5xx_device, expand_iqs5xx_interrupts};
 use crate::codegen::input_device::pmw33xx::expand_pmw33xx_device;
 use crate::codegen::input_device::pmw3610::expand_pmw3610_device;
-use crate::codegen::keyboard_config::read_keyboard_toml_config;
+use crate::codegen::keyboard_config::{configured_usb_device_release, read_keyboard_toml_config};
 use crate::codegen::matrix::{
     expand_bootmagic_check, expand_matrix_direct_pins, expand_matrix_input_output_pins,
 };
@@ -60,6 +60,7 @@ pub(crate) fn parse_split_peripheral_mod(
             Some(s) => quote! { #s },
             None => quote! { ::rmk::config::RMK_BUILD_INFO },
         };
+        let device_release = configured_usb_device_release();
         quote! {
             const KEYBOARD_DEVICE_CONFIG: ::rmk::config::DeviceConfig = ::rmk::config::DeviceConfig {
                 vid: #vid,
@@ -67,6 +68,7 @@ pub(crate) fn parse_split_peripheral_mod(
                 manufacturer: #manufacturer,
                 product_name: #product_name,
                 serial_number: #serial_number_tokens,
+                device_release: #device_release,
             };
         }
     } else {

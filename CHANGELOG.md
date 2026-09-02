@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.1.9-rc.2
+
+Corrective release candidate for the standalone K:04 Series after review of `v0.1.9-rc.1`.
+
+- CI now builds K:04, K:04 Mini, and K:04 Micro with the validated `production_v22` feature set
+- Restored live left/right Ball DPI settings while retaining 600 CPI as the production default
+- Applied USB `bcdDevice = 0x0109` to the actual device descriptor
+- Enabled right-half split liveness recovery in non-diagnostic production builds
+- Removed a non-portable atomic read-modify-write from the generic BLE path
+- Queued each native i16 mouse delta once and moved HID chunking into the transport writers, preventing one extreme event from filling the report queue
+- Restored the pre-v22 4/8 ms cadence and i8 event width for K:04 Qube halves
+- Added regression coverage for the production workflow, USB BCD, split recovery, Qube isolation, live DPI, and extreme motion deltas
+
 ## v0.1.9-rc.1
 
 Release candidate for the standalone K:04 Series: K:04, K:04 Mini, and K:04 Micro. K:04 Qube profiles and all other keyboards remain on v0.1.8.

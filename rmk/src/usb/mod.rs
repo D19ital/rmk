@@ -14,7 +14,7 @@ use static_cell::StaticCell;
 use usbd_hid::descriptor::AsInputReport;
 
 use crate::RawMutex;
-use crate::channel::USB_REPORT_CHANNEL;
+use crate::channel::{QueuedReportPayload, USB_REPORT_CHANNEL, WideMouseReport};
 use crate::config::DeviceConfig;
 use crate::core_traits::Runnable;
 #[cfg(feature = "steno")]
@@ -114,10 +114,41 @@ impl<'a, 'd, D: Driver<'d>> UsbKeyboardWriter<'a, 'd, D> {
 
     pub(crate) async fn run_writer(&mut self) -> ! {
         loop {
-            let report = USB_REPORT_CHANNEL.receive().await;
+            match USB_REPORT_CHANNEL.receive().await.into_payload() {
+                QueuedReportPayload::Hid(report) => {
+                    if let Some(Err(e)) = write_while_usb_configured(self.write_report(&report)).await {
+                        error!("Failed to send report: {:?}", e);
+                    }
+                }
+                QueuedReportPayload::WideMouse(report) => self.write_wide_mouse(report).await,
+            }
+        }
+    }
 
-            if let Some(Err(e)) = write_while_usb_configured(self.write_report(report.report())).await {
-                error!("Failed to send report: {:?}", e);
+    async fn write_wide_mouse(&mut self, mut mouse: WideMouseReport) {
+        loop {
+            let has_relative_motion = mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.pan != 0;
+            let (x, y, wheel, pan) = if has_relative_motion {
+                crate::mouse_chunk::take_vector_chunk(&mut mouse.x, &mut mouse.y, &mut mouse.wheel, &mut mouse.pan)
+            } else {
+                (0, 0, 0, 0)
+            };
+            let report = Report::MouseReport(usbd_hid::descriptor::MouseReport {
+                buttons: mouse.buttons,
+                x,
+                y,
+                wheel,
+                pan,
+            });
+
+            match write_while_usb_configured(self.write_report(&report)).await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => error!("Failed to send report: {:?}", e),
+                None => return,
+            }
+
+            if mouse.x == 0 && mouse.y == 0 && mouse.wheel == 0 && mouse.pan == 0 {
+                return;
             }
         }
     }
@@ -191,6 +222,7 @@ pub(crate) fn new_usb_builder<'d, D: Driver<'d>>(driver: D, keyboard_config: Dev
     usb_config.manufacturer = Some(keyboard_config.manufacturer);
     usb_config.product = Some(keyboard_config.product_name);
     usb_config.serial_number = Some(keyboard_config.serial_number);
+    usb_config.device_release = keyboard_config.device_release;
     usb_config.max_power = 450;
     usb_config.supports_remote_wakeup = true;
 

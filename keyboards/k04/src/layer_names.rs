@@ -92,8 +92,8 @@ const MODULE_SELECT_TOUCH: u8 = 3;
 const MODULE_DEFAULTS: [u8; MODULE_SETTINGS_LEN] = {
     let mut data = [0u8; MODULE_SETTINGS_LEN];
     data[IDX_VERSION] = MODULE_SETTINGS_VERSION;
-    data[IDX_LEFT_BALL_DPI] = 4;
-    data[IDX_RIGHT_BALL_DPI] = 4;
+    data[IDX_LEFT_BALL_DPI] = if cfg!(feature = "production_v22") { 2 } else { 4 };
+    data[IDX_RIGHT_BALL_DPI] = if cfg!(feature = "production_v22") { 2 } else { 4 };
     data[IDX_LEFT_TOUCH_DPI] = 3;
     data[IDX_RIGHT_TOUCH_DPI] = 3;
     data[IDX_FLAGS] = DEFAULT_ACCELERATION_FLAGS;

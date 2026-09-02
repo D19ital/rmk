@@ -1,5 +1,3 @@
-use core::sync::atomic::{AtomicU32, Ordering};
-
 use bt_hci::cmd::le::{LeReadLocalSupportedFeatures, LeReadPhy, LeSetPhy};
 use bt_hci::controller::{ControllerCmdAsync, ControllerCmdSync};
 use embassy_futures::join::join3;
@@ -27,7 +25,7 @@ use crate::ble::sleep::{
     InputActivityWaiter, report_activity, request_local_sleep, request_sleep, reset_host_power_input,
     take_host_power_input, wait_for_host_power_input,
 };
-use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL};
+use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL, QueuedReportPayload, WideMouseReport};
 use crate::config::{BleBatteryConfig, BleHostPowerConfig, RmkConfig};
 use crate::core_traits::Runnable;
 use crate::event::BleAdvertisingMode;
@@ -91,8 +89,6 @@ const HCI_LINK_UPDATE_RETRY_MS: u64 = 20;
 // before handling controller-level collisions from procedures started by the
 // peer or stack itself.
 static BLE_HCI_LINK_UPDATE_MUTEX: Mutex<crate::RawMutex, ()> = Mutex::new(());
-static BLE_HOST_SESSION_SEQUENCE: AtomicU32 = AtomicU32::new(0);
-
 #[cfg(feature = "host")]
 static VIAL_BLE_ACTIVITY: Signal<crate::RawMutex, ()> = Signal::new();
 
@@ -251,6 +247,7 @@ where
 
         let connection_loop = async {
             let mut resuming_from_sleep = false;
+            let mut session_sequence = 0u32;
             loop {
                 #[cfg(feature = "split")]
                 if let Either::Second(()) = select(
@@ -286,7 +283,8 @@ where
                 .await
                 {
                     Either::First(Ok(conn)) => {
-                        let session_id = BLE_HOST_SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+                        session_sequence = session_sequence.wrapping_add(1);
+                        let session_id = session_sequence;
                         info!(
                             "[BLE_SESSION_V15] id={} phase=start raw_connected={} connections_max={} l2cap_max={}",
                             session_id,
@@ -1018,7 +1016,9 @@ struct BondedReconnectWindows {
 }
 
 fn bonded_reconnect_windows(reconnect_timeout_ms: u64) -> BondedReconnectWindows {
-    let directed_high_duty_ms = reconnect_timeout_ms.min(DIRECTED_RECONNECT_WINDOW_MS);
+    // Directed high-duty reconnect is disabled for this profile, so the
+    // reserved window is always zero.
+    let directed_high_duty_ms = DIRECTED_RECONNECT_WINDOW_MS;
     let fast_undirected_ms = reconnect_timeout_ms
         .min(FAST_BONDED_RECONNECT_TOTAL_MS)
         .saturating_sub(directed_high_duty_ms);
@@ -1730,9 +1730,12 @@ where
             };
             let enqueued_at = queued.enqueued_at();
 
-            match queued.into_report() {
-                crate::hid::Report::MouseReport(mouse) => AccumulatedMouseReport::new(mouse, enqueued_at),
-                report => {
+            match queued.into_payload() {
+                QueuedReportPayload::Hid(crate::hid::Report::MouseReport(mouse)) => {
+                    AccumulatedMouseReport::new(mouse, enqueued_at)
+                }
+                QueuedReportPayload::WideMouse(mouse) => AccumulatedMouseReport::new_wide(mouse, enqueued_at),
+                QueuedReportPayload::Hid(report) => {
                     if let Err(exit) = write_ble_hid_report(writer, &report, fail_closed, None).await {
                         return exit;
                     }
@@ -1767,16 +1770,10 @@ where
         // emitted in multiple HID-sized chunks.
         if deferred_report.is_none() {
             while let Ok(queued) = BLE_REPORT_CHANNEL.try_receive() {
-                let mergeable = matches!(
-                    queued.report(),
-                    crate::hid::Report::MouseReport(next) if mouse.can_merge(next)
-                );
+                let mergeable = mouse.can_merge_payload(queued.payload());
                 if mergeable {
                     let enqueued_at = queued.enqueued_at();
-                    let crate::hid::Report::MouseReport(next) = queued.into_report() else {
-                        unreachable!();
-                    };
-                    mouse.merge(next, enqueued_at);
+                    mouse.merge_payload(queued.into_payload(), enqueued_at);
                     merged_reports = merged_reports.saturating_add(1);
                 } else {
                     deferred_report = Some(queued);
@@ -1909,6 +1906,7 @@ struct AccumulatedMouseReport {
     pan: i32,
     oldest_enqueued_at: Instant,
     source_reports: u32,
+    preserve_vector: bool,
 }
 
 impl AccumulatedMouseReport {
@@ -1921,11 +1919,36 @@ impl AccumulatedMouseReport {
             pan: i32::from(report.pan),
             oldest_enqueued_at: enqueued_at,
             source_reports: 1,
+            preserve_vector: cfg!(feature = "mouse_vector_preserve"),
+        }
+    }
+
+    fn new_wide(report: WideMouseReport, enqueued_at: Instant) -> Self {
+        Self {
+            buttons: report.buttons,
+            x: report.x,
+            y: report.y,
+            wheel: report.wheel,
+            pan: report.pan,
+            oldest_enqueued_at: enqueued_at,
+            source_reports: 1,
+            // The old pointing path vector-chunked every native i16 event
+            // before enqueueing. Preserve that behavior after moving the
+            // chunking into the transport writer.
+            preserve_vector: true,
         }
     }
 
     fn can_merge(&self, report: &MouseReport) -> bool {
         self.buttons == report.buttons
+    }
+
+    fn can_merge_payload(&self, payload: &QueuedReportPayload) -> bool {
+        match payload {
+            QueuedReportPayload::Hid(crate::hid::Report::MouseReport(report)) => self.can_merge(report),
+            QueuedReportPayload::WideMouse(report) => self.buttons == report.buttons,
+            QueuedReportPayload::Hid(_) => false,
+        }
     }
 
     fn merge(&mut self, report: MouseReport, enqueued_at: Instant) {
@@ -1936,6 +1959,25 @@ impl AccumulatedMouseReport {
         self.pan = self.pan.saturating_add(i32::from(report.pan));
         self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
         self.source_reports = self.source_reports.saturating_add(1);
+    }
+
+    fn merge_wide(&mut self, report: WideMouseReport, enqueued_at: Instant) {
+        debug_assert_eq!(self.buttons, report.buttons);
+        self.x = self.x.saturating_add(report.x);
+        self.y = self.y.saturating_add(report.y);
+        self.wheel = self.wheel.saturating_add(report.wheel);
+        self.pan = self.pan.saturating_add(report.pan);
+        self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
+        self.source_reports = self.source_reports.saturating_add(1);
+        self.preserve_vector = true;
+    }
+
+    fn merge_payload(&mut self, payload: QueuedReportPayload, enqueued_at: Instant) {
+        match payload {
+            QueuedReportPayload::Hid(crate::hid::Report::MouseReport(report)) => self.merge(report, enqueued_at),
+            QueuedReportPayload::WideMouse(report) => self.merge_wide(report, enqueued_at),
+            QueuedReportPayload::Hid(_) => unreachable!("non-mouse payload passed the merge boundary"),
+        }
     }
 
     fn take_write_diag(&mut self) -> MouseWriteDiag {
@@ -1951,35 +1993,30 @@ impl AccumulatedMouseReport {
         let input_x = self.x;
         let input_y = self.y;
 
-        #[cfg(not(feature = "mouse_vector_preserve"))]
         fn take_axis(value: &mut i32) -> i8 {
             let chunk = (*value).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
             *value -= i32::from(chunk);
             chunk
         }
 
-        #[cfg(feature = "mouse_vector_preserve")]
-        let vector_chunk =
-            crate::mouse_chunk::take_vector_chunk(&mut self.x, &mut self.y, &mut self.wheel, &mut self.pan);
+        let vector_chunk = self
+            .preserve_vector
+            .then(|| crate::mouse_chunk::take_vector_chunk(&mut self.x, &mut self.y, &mut self.wheel, &mut self.pan));
 
         let report = MouseReport {
             buttons: self.buttons,
-            #[cfg(not(feature = "mouse_vector_preserve"))]
-            x: take_axis(&mut self.x),
-            #[cfg(feature = "mouse_vector_preserve")]
-            x: vector_chunk.0,
-            #[cfg(not(feature = "mouse_vector_preserve"))]
-            y: take_axis(&mut self.y),
-            #[cfg(feature = "mouse_vector_preserve")]
-            y: vector_chunk.1,
-            #[cfg(not(feature = "mouse_vector_preserve"))]
-            wheel: take_axis(&mut self.wheel),
-            #[cfg(feature = "mouse_vector_preserve")]
-            wheel: vector_chunk.2,
-            #[cfg(not(feature = "mouse_vector_preserve"))]
-            pan: take_axis(&mut self.pan),
-            #[cfg(feature = "mouse_vector_preserve")]
-            pan: vector_chunk.3,
+            x: vector_chunk
+                .map(|chunk| chunk.0)
+                .unwrap_or_else(|| take_axis(&mut self.x)),
+            y: vector_chunk
+                .map(|chunk| chunk.1)
+                .unwrap_or_else(|| take_axis(&mut self.y)),
+            wheel: vector_chunk
+                .map(|chunk| chunk.2)
+                .unwrap_or_else(|| take_axis(&mut self.wheel)),
+            pan: vector_chunk
+                .map(|chunk| chunk.3)
+                .unwrap_or_else(|| take_axis(&mut self.pan)),
         };
 
         (
@@ -2708,6 +2745,7 @@ mod tests {
                 pan: 0,
                 oldest_enqueued_at: now,
                 source_reports: 1,
+                preserve_vector: true,
             };
             let mut total_x = 0i32;
             let mut total_y = 0i32;
@@ -2721,6 +2759,33 @@ mod tests {
             assert_eq!((total_x, total_y), (x, y));
             assert_eq!(chunks, 3);
         }
+    }
+
+    #[test]
+    fn one_extreme_wide_queue_item_preserves_the_complete_delta() {
+        let mut accumulated = super::AccumulatedMouseReport::new_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: i32::from(i16::MAX),
+                y: i32::from(i16::MIN),
+                wheel: 0,
+                pan: 0,
+            },
+            Instant::now(),
+        );
+        let mut total_x = 0i32;
+        let mut total_y = 0i32;
+        let mut chunks = 0u32;
+
+        while accumulated.has_relative_motion() {
+            let (chunk, _) = accumulated.take_chunk();
+            total_x += i32::from(chunk.x);
+            total_y += i32::from(chunk.y);
+            chunks += 1;
+        }
+
+        assert_eq!((total_x, total_y), (i32::from(i16::MAX), i32::from(i16::MIN)));
+        assert_eq!(chunks, 259);
     }
 
     #[test]

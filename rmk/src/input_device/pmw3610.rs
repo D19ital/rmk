@@ -238,7 +238,7 @@ impl<SPI: SpiBus, CS: OutputPin, MOTION: InputPin + Wait> Pmw3610<SPI, CS, MOTIO
     /// Read every register that can change motion orientation or tracking
     /// mode.  The caller must suppress motion until this snapshot is valid.
     pub async fn configuration_health(&mut self, cpi: u16) -> Result<Pmw3610Health, PointingDriverError> {
-        if !(RES_MIN..=RES_MAX).contains(&cpi) || cpi % RES_STEP != 0 {
+        if !(RES_MIN..=RES_MAX).contains(&cpi) || !cpi.is_multiple_of(RES_STEP) {
             return Err(PointingDriverError::InvalidCpi);
         }
 
@@ -553,7 +553,13 @@ where
             0
         };
         #[cfg(feature = "rtt_diag")]
-        crate::rtt_diag::record_pmw_optics(motion_set, _squal, shutter_val, SHUTTER_SMART_THRESHOLD, self.smart_flag);
+        crate::rtt_diag::record_pmw_optics(
+            motion_set,
+            _squal,
+            shutter_val,
+            SHUTTER_SMART_THRESHOLD,
+            self.smart_flag,
+        );
 
         if !motion_set {
             #[cfg(feature = "rtt_diag")]

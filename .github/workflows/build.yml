@@ -36,14 +36,17 @@ jobs:
             output_name: k04_series_k04
             keyboard_toml: keyboard.toml
             vial_json: vial.json
+            build_features: "--features production_v22"
           - keyboard: k04
             output_name: k04_series_mini
             keyboard_toml: keyboard_mini.toml
             vial_json: vial_mini.json
+            build_features: "--features production_v22"
           - keyboard: k04
             output_name: k04_series_micro
             keyboard_toml: keyboard_micro.toml
             vial_json: vial_micro.json
+            build_features: "--features production_v22"
           - keyboard: imperial44
             output_name: imperial44
             keyboard_toml: keyboard.toml
@@ -109,7 +112,7 @@ jobs:
           KEYBOARD_TOML_PATH: ${{ github.workspace }}/keyboards/${{ matrix.keyboard }}/${{ matrix.keyboard_toml }}
           RUST_MIN_STACK: "33554432"
           VIAL_JSON_PATH: ${{ github.workspace }}/keyboards/${{ matrix.keyboard }}/${{ matrix.vial_json }}
-        run: cargo build --release --bin central
+        run: cargo build --release --bin central ${{ matrix.build_features }}
 
       - name: Build Peripheral
         working-directory: keyboards/${{ matrix.keyboard }}
@@ -118,7 +121,7 @@ jobs:
           KEYBOARD_TOML_PATH: ${{ github.workspace }}/keyboards/${{ matrix.keyboard }}/${{ matrix.keyboard_toml }}
           RUST_MIN_STACK: "33554432"
           VIAL_JSON_PATH: ${{ github.workspace }}/keyboards/${{ matrix.keyboard }}/${{ matrix.vial_json }}
-        run: cargo build --release --bin peripheral
+        run: cargo build --release --bin peripheral ${{ matrix.build_features }}
 
       - name: Convert to UF2
         working-directory: keyboards/${{ matrix.keyboard }}

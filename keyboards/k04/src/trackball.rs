@@ -12,7 +12,9 @@ use rmk::processor::Processor;
 use crate::module_settings;
 
 mod motion_pacing;
-use motion_pacing::{take_report_axis, LOCAL_REPORT_INTERVAL_US, SPLIT_REPORT_INTERVAL_US};
+use motion_pacing::{
+    take_report_axis, LEGACY_TRANSPORT_REPORT_INTERVAL_US, LOCAL_REPORT_INTERVAL_US, SPLIT_REPORT_INTERVAL_US,
+};
 
 #[cfg(all(
     feature = "production_v22",
@@ -59,6 +61,7 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 // accumulated movement for the central's vector-preserving HID writer.
 const LOCAL_REPORT_INTERVAL: Duration = Duration::from_micros(LOCAL_REPORT_INTERVAL_US);
 const SPLIT_REPORT_INTERVAL: Duration = Duration::from_micros(SPLIT_REPORT_INTERVAL_US);
+const LEGACY_TRANSPORT_REPORT_INTERVAL: Duration = Duration::from_micros(LEGACY_TRANSPORT_REPORT_INTERVAL_US);
 // If MOTION stops toggling during an active gesture, briefly poll at the
 // report cadence. This bridges transient GPIO/power-mode gaps without keeping
 // the sensor awake indefinitely after the user stops the ball.
@@ -97,7 +100,7 @@ pub fn new_trackball(
     Pmw3610::new(id, spi, cs, Some(motion), config)
 }
 
-#[cfg(any(feature = "pmw_raw_600_diag", feature = "pmw_axes_600"))]
+#[cfg(any(feature = "pmw_raw_600_diag", feature = "pmw_axes_600_diag"))]
 fn configured_ball_cpi(_device_id: u8) -> u16 {
     600
 }
@@ -110,7 +113,7 @@ fn configured_ball_cpi(_device_id: u8) -> u16 {
 #[cfg(not(any(
     feature = "pmw_raw_600_diag",
     feature = "pmw_raw_1000_diag",
-    feature = "pmw_axes_600"
+    feature = "pmw_axes_600_diag"
 )))]
 fn configured_ball_cpi(device_id: u8) -> u16 {
     module_settings::ball_cpi(device_id)
@@ -610,10 +613,21 @@ impl Trackball {
     }
 
     fn report_interval(&self) -> Duration {
-        if self.is_central {
+        if cfg!(any(feature = "production_v22", feature = "pmw_axes_600_diag")) {
+            if self.is_central {
+                LOCAL_REPORT_INTERVAL
+            } else {
+                SPLIT_REPORT_INTERVAL
+            }
+        } else if self.is_central
+            && matches!(
+                rmk::state::current_connection_status().decide_active(),
+                Some(rmk::types::connection::ConnectionType::Usb)
+            )
+        {
             LOCAL_REPORT_INTERVAL
         } else {
-            SPLIT_REPORT_INTERVAL
+            LEGACY_TRANSPORT_REPORT_INTERVAL
         }
     }
 

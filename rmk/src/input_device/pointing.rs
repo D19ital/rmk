@@ -10,7 +10,7 @@ use rmk_types::action::Action;
 use rmk_types::keycode::HidKeyCode;
 use usbd_hid::descriptor::MouseReport;
 
-use crate::channel::send_hid_report;
+use crate::channel::{send_hid_mouse_report, send_hid_report};
 use crate::core_traits::Runnable;
 #[cfg(feature = "split")]
 use crate::event::{ActionEvent, KeyboardEvent, PeripheralSettingsEvent};
@@ -1263,32 +1263,7 @@ async fn send_mouse_report(source_buttons: u8, buttons: u8, x: i16, y: i16, whee
 }
 
 async fn send_mouse_report_unchecked(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
-    let mut x = i32::from(x);
-    let mut y = i32::from(y);
-    let mut wheel = i32::from(wheel);
-    let mut pan = i32::from(pan);
-
-    loop {
-        let has_relative_motion = x != 0 || y != 0 || wheel != 0 || pan != 0;
-        let (chunk_x, chunk_y, chunk_wheel, chunk_pan) = if has_relative_motion {
-            crate::mouse_chunk::take_vector_chunk(&mut x, &mut y, &mut wheel, &mut pan)
-        } else {
-            (0, 0, 0, 0)
-        };
-
-        send_hid_report(Report::MouseReport(MouseReport {
-            buttons,
-            x: chunk_x,
-            y: chunk_y,
-            wheel: chunk_wheel,
-            pan: chunk_pan,
-        }))
-        .await;
-
-        if x == 0 && y == 0 && wheel == 0 && pan == 0 {
-            break;
-        }
-    }
+    send_hid_mouse_report(buttons, x, y, wheel, pan).await;
 }
 
 /// PointingProcessor that converts motion events to mouse reports

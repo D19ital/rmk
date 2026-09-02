@@ -22,8 +22,8 @@ use crate::split::{SPLIT_MESSAGE_MAX_SIZE, SplitMessage, encode_split_message};
 use crate::state::update_status;
 
 const SPLIT_COMPANY_ID: u16 = 0xe118;
-#[cfg(feature = "rtt_diag")]
 const SPLIT_RSSI_INTERVAL: Duration = Duration::from_secs(1);
+const SPLIT_RSSI_FAILURE_LIMIT: u8 = 2;
 const DIRECTED_SPLIT_RECONNECT_SECS: u64 = 2;
 const SPLIT_ADVERTISING_RELEASE_GUARD_MS: u64 = 100;
 
@@ -227,7 +227,7 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
                         }
                     }
                     let mut peripheral = SplitPeripheral::new(split_driver);
-                    match select(peripheral.run(), log_split_rssi(stack, conn.raw(), id)).await {
+                    match select(peripheral.run(), watch_split_link_health(stack, conn.raw(), id)).await {
                         Either::First(_) => {
                             info!("[SPLIT_RECOVERY_V19] side=R id={} source=transport", id);
                         }
@@ -263,8 +263,7 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
     join(ble_task(runner), peri_task).await;
 }
 
-#[cfg(feature = "rtt_diag")]
-async fn log_split_rssi<'b, 's: 'b, C, P>(
+async fn watch_split_link_health<'b, 's: 'b, C, P>(
     stack: &'b Stack<'s, C, P>,
     conn: &Connection<'b, P>,
     peripheral_id: usize,
@@ -273,30 +272,32 @@ where
     C: Controller + ControllerCmdSync<ReadRssi>,
     P: PacketPool,
 {
-    const FAILURE_LIMIT: u8 = 2;
     let mut consecutive_failures = 0u8;
     loop {
         Timer::after(SPLIT_RSSI_INTERVAL).await;
         match conn.rssi(stack).await {
             Ok(rssi) => {
-                consecutive_failures = 0;
+                split_rssi_requires_restart(&mut consecutive_failures, true);
+                #[cfg(feature = "rtt_diag")]
                 info!("[SPLIT_RSSI] side=R id={} rssi_dbm={}", peripheral_id, rssi);
+                #[cfg(not(feature = "rtt_diag"))]
+                let _ = (peripheral_id, rssi);
             }
             Err(e) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
+                let restart = split_rssi_requires_restart(&mut consecutive_failures, false);
                 #[cfg(feature = "defmt")]
                 warn!(
                     "[SPLIT_RSSI] side=R id={} read_error={:?} failure={}/{}",
                     peripheral_id,
                     defmt::Debug2Format(&e),
                     consecutive_failures,
-                    FAILURE_LIMIT
+                    SPLIT_RSSI_FAILURE_LIMIT
                 );
                 // A reset central can leave the GATT runner waiting longer
                 // than the controller's RSSI command. Treat two consecutive
                 // failures as authoritative link loss so one transient
                 // controller collision cannot flap a healthy connection.
-                if consecutive_failures >= FAILURE_LIMIT {
+                if restart {
                     return Err(e);
                 }
             }
@@ -304,17 +305,14 @@ where
     }
 }
 
-#[cfg(not(feature = "rtt_diag"))]
-async fn log_split_rssi<'b, 's: 'b, C, P>(
-    _stack: &'b Stack<'s, C, P>,
-    _conn: &Connection<'b, P>,
-    _peripheral_id: usize,
-) -> Result<(), BleHostError<C::Error>>
-where
-    C: Controller + ControllerCmdSync<ReadRssi>,
-    P: PacketPool,
-{
-    core::future::pending().await
+fn split_rssi_requires_restart(consecutive_failures: &mut u8, succeeded: bool) -> bool {
+    if succeeded {
+        *consecutive_failures = 0;
+        false
+    } else {
+        *consecutive_failures = consecutive_failures.saturating_add(1);
+        *consecutive_failures >= SPLIT_RSSI_FAILURE_LIMIT
+    }
 }
 
 async fn validate_split_central<T: SplitReader + SplitWriter>(driver: &mut T) -> bool {
@@ -475,7 +473,7 @@ async fn ble_task<C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool>(m
 
 #[cfg(test)]
 mod tests {
-    use super::{split_advertising_windows, split_central_address_allowed};
+    use super::{split_advertising_windows, split_central_address_allowed, split_rssi_requires_restart};
 
     const OLD_QUBE: [u8; 6] = [1, 2, 3, 4, 5, 6];
     const NEW_QUBE: [u8; 6] = [7, 8, 9, 10, 11, 12];
@@ -505,5 +503,16 @@ mod tests {
     fn zero_split_timeout_preserves_legacy_windows() {
         assert_eq!(split_advertising_windows(true, 0), (10, 10, 300));
         assert_eq!(split_advertising_windows(false, 0), (0, 10, 300));
+    }
+
+    #[test]
+    fn split_health_watchdog_restarts_only_after_two_consecutive_failures() {
+        let mut failures = 0;
+        assert!(!split_rssi_requires_restart(&mut failures, false));
+        assert_eq!(failures, 1);
+        assert!(!split_rssi_requires_restart(&mut failures, true));
+        assert_eq!(failures, 0);
+        assert!(!split_rssi_requires_restart(&mut failures, false));
+        assert!(split_rssi_requires_restart(&mut failures, false));
     }
 }

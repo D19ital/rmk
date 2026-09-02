@@ -22,6 +22,7 @@ pub(crate) fn expand_keyboard_info(
         Some(s) => quote! { #s },
         None => quote! { ::rmk::config::RMK_BUILD_INFO },
     };
+    let device_release = configured_usb_device_release();
 
     let num_col = layout.cols as usize;
     let num_row = layout.rows as usize;
@@ -39,8 +40,28 @@ pub(crate) fn expand_keyboard_info(
             manufacturer: #manufacturer,
             product_name: #product_name,
             serial_number: #serial_number_tokens,
+            device_release: #device_release,
         };
     }
+}
+
+pub(crate) fn configured_usb_device_release() -> u16 {
+    std::env::var("RMK_FIRMWARE_VERSION_BCD")
+        .ok()
+        .map(|value| {
+            parse_usb_device_release(&value).unwrap_or_else(|| {
+                panic!("RMK_FIRMWARE_VERSION_BCD must be a hexadecimal u16 such as 0x0109, got {value:?}")
+            })
+        })
+        .unwrap_or(0x0010)
+}
+
+fn parse_usb_device_release(value: &str) -> Option<u16> {
+    let digits = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))?;
+    u16::from_str_radix(digits, 16).ok()
 }
 
 pub(crate) fn expand_vial_config(host: &Host) -> proc_macro2::TokenStream {
@@ -103,7 +124,7 @@ fn parse_firmware_version(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_firmware_version;
+    use super::{parse_firmware_version, parse_usb_device_release};
 
     #[test]
     fn parses_via_runtime_firmware_version() {
@@ -116,5 +137,18 @@ mod tests {
         assert_eq!(parse_firmware_version("0.1"), None);
         assert_eq!(parse_firmware_version("0.1.256"), None);
         assert_eq!(parse_firmware_version("0.1.3.4"), None);
+    }
+
+    #[test]
+    fn parses_usb_device_release_bcd() {
+        assert_eq!(parse_usb_device_release("0x0109"), Some(0x0109));
+        assert_eq!(parse_usb_device_release("0X1234"), Some(0x1234));
+    }
+
+    #[test]
+    fn rejects_invalid_usb_device_release_bcd() {
+        assert_eq!(parse_usb_device_release("0109"), None);
+        assert_eq!(parse_usb_device_release("0x10000"), None);
+        assert_eq!(parse_usb_device_release("release"), None);
     }
 }

@@ -245,8 +245,9 @@ fn ensure_initialized() {
         return;
     }
     SETTINGS[0].store(VERSION, Ordering::Relaxed);
-    SETTINGS[IDX_LEFT_BALL_DPI].store(4, Ordering::Relaxed);
-    SETTINGS[IDX_RIGHT_BALL_DPI].store(4, Ordering::Relaxed);
+    let default_ball_dpi = if cfg!(feature = "production_v22") { 2 } else { 4 };
+    SETTINGS[IDX_LEFT_BALL_DPI].store(default_ball_dpi, Ordering::Relaxed);
+    SETTINGS[IDX_RIGHT_BALL_DPI].store(default_ball_dpi, Ordering::Relaxed);
     SETTINGS[IDX_LEFT_TOUCH_DPI].store(3, Ordering::Relaxed);
     SETTINGS[IDX_RIGHT_TOUCH_DPI].store(3, Ordering::Relaxed);
     SETTINGS[IDX_LEFT_SCROLL_SENS].store(8, Ordering::Relaxed);

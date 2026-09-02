@@ -409,6 +409,35 @@ for file in "${memory_files[@]}"; do
         || fail "$file: application linker must stop at 0xCC000"
 done
 
+python3 - <<'PY' || fail "K:04 standalone CI must build the production profile"
+from pathlib import Path
+
+workflow = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
+for output_name in ("k04_series_k04", "k04_series_mini", "k04_series_micro"):
+    marker = f"output_name: {output_name}"
+    start = workflow.index(marker)
+    end = workflow.find("          - keyboard:", start + len(marker))
+    stanza = workflow[start:] if end == -1 else workflow[start:end]
+    assert 'build_features: "--features production_v22"' in stanza, output_name
+
+assert "cargo build --release --bin central ${{ matrix.build_features }}" in workflow
+assert "cargo build --release --bin peripheral ${{ matrix.build_features }}" in workflow
+PY
+
+rg -Fq 'usb_config.device_release = keyboard_config.device_release;' rmk/src/usb/mod.rs \
+    || fail "rmk/src/usb/mod.rs: configured bcdDevice is not applied to the USB descriptor"
+rg -Fq 'device_release: #device_release' rmk-macro/src/codegen/keyboard_config.rs \
+    || fail "rmk-macro: generated keyboard identity does not carry bcdDevice"
+if rg -Fq 'BLE_HOST_SESSION_SEQUENCE.fetch_add' rmk/src/ble/mod.rs; then
+    fail "rmk/src/ble/mod.rs: generic BLE path must not require atomic read-modify-write"
+fi
+rg -Fq 'watch_split_link_health(stack, conn.raw(), id)' rmk/src/split/ble/peripheral.rs \
+    || fail "rmk split peripheral: production split-health recovery is missing"
+rg -Fq 'send_hid_mouse_report(buttons, x, y, wheel, pan).await;' rmk/src/input_device/pointing.rs \
+    || fail "rmk pointing: native i16 motion must enter the HID queue as one item"
+rg -Fq 'cfg!(feature = "production_v22") && !is_central' keyboards/k04/src/trackball/motion_pacing.rs \
+    && fail "keyboards/k04: Qube cadence must be isolated from the standalone production profile"
+
 mapfile -t build_scripts < <(
     git ls-files 'keyboards/*/build.rs' |
         while read -r file; do
@@ -417,8 +446,8 @@ mapfile -t build_scripts < <(
 )
 for file in "${build_scripts[@]}"; do
     if [[ "$file" == "keyboards/k04/build.rs" ]]; then
-        rg -q 'const STANDALONE_RELEASE_VERSION: &str = "0\.1\.9-rc\.1";' "$file" \
-            || fail "$file: K:04 Standalone release version must be 0.1.9-rc.1"
+        rg -q 'const STANDALONE_RELEASE_VERSION: &str = "0\.1\.9-rc\.2";' "$file" \
+            || fail "$file: K:04 Standalone release version must be 0.1.9-rc.2"
         rg -q 'const STANDALONE_FIRMWARE_VERSION: &str = "0\.1\.9";' "$file" \
             || fail "$file: K:04 Standalone numeric firmware version must be 0.1.9"
         rg -q 'const STANDALONE_FIRMWARE_VERSION_BCD: &str = "0x0109";' "$file" \
@@ -445,7 +474,7 @@ for file in "${vial_definitions[@]}"; do
     expected_version="0.1.8"
     case "$file" in
         keyboards/k04/vial.json|keyboards/k04/vial_mini.json|keyboards/k04/vial_micro.json)
-            expected_version="0.1.9-rc.1"
+            expected_version="0.1.9-rc.2"
             ;;
     esac
     jq -e '.manufacturer == "Ergohaven"' "$file" >/dev/null \
