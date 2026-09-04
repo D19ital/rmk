@@ -6,6 +6,7 @@ use embassy_sync::channel::{Channel, TrySendError};
 #[cfg(any(feature = "_ble", all(feature = "storage", feature = "host")))]
 use embassy_sync::signal::Signal;
 pub use embassy_sync::{blocking_mutex, channel, pubsub, zerocopy_channel};
+use embassy_time::Instant;
 use rmk_types::connection::ConnectionType;
 #[cfg(feature = "_ble")]
 use {
@@ -22,7 +23,85 @@ use crate::hid::{KeyboardReport, Report};
 use crate::{FLASH_CHANNEL_SIZE, storage::FlashOperationMessage};
 use crate::{REPORT_CHANNEL_SIZE, RawMutex};
 
-type ReportChannel = Channel<RawMutex, Report, REPORT_CHANNEL_SIZE>;
+/// One HID report together with the instant at which its producer entered the
+/// transport path. The timestamp lets RTT diagnostics measure motion age at
+/// the actual BLE notification rather than inferring it from queue length.
+#[derive(Debug)]
+pub struct QueuedReport {
+    payload: QueuedReportPayload,
+    enqueued_at: Instant,
+}
+
+/// A relative mouse report kept at the event's native width until the active
+/// transport is ready to serialize it as one or more signed 8-bit HID reports.
+/// Keeping one input event as one queue item prevents an extreme i16 delta from
+/// filling the bounded HID queue with hundreds of pre-expanded reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WideMouseReport {
+    pub(crate) buttons: u8,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) wheel: i32,
+    pub(crate) pan: i32,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueuedReportPayload {
+    Hid(Report),
+    WideMouse(WideMouseReport),
+}
+
+impl QueuedReport {
+    pub(crate) fn new(report: Report) -> Self {
+        Self {
+            payload: QueuedReportPayload::Hid(report),
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn new_wide_mouse(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) -> Self {
+        Self {
+            payload: QueuedReportPayload::WideMouse(WideMouseReport {
+                buttons,
+                x: i32::from(x),
+                y: i32::from(y),
+                wheel: i32::from(wheel),
+                pan: i32::from(pan),
+            }),
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    /// Returns the wrapped HID report without consuming the queue item.
+    pub fn report(&self) -> &Report {
+        match &self.payload {
+            QueuedReportPayload::Hid(report) => report,
+            QueuedReportPayload::WideMouse(_) => panic!("wide mouse queue item is not a serialized HID report"),
+        }
+    }
+
+    /// Consumes the queue item and returns its wrapped HID report.
+    pub fn into_report(self) -> Report {
+        match self.payload {
+            QueuedReportPayload::Hid(report) => report,
+            QueuedReportPayload::WideMouse(_) => panic!("wide mouse queue item is not a serialized HID report"),
+        }
+    }
+
+    pub(crate) fn payload(&self) -> &QueuedReportPayload {
+        &self.payload
+    }
+
+    pub(crate) fn into_payload(self) -> QueuedReportPayload {
+        self.payload
+    }
+
+    pub(crate) fn enqueued_at(&self) -> Instant {
+        self.enqueued_at
+    }
+}
+
+type ReportChannel = Channel<RawMutex, QueuedReport, REPORT_CHANNEL_SIZE>;
 
 /// Signal for LED indicator, used in BLE keyboards only since BLE receiving is not async
 #[cfg(feature = "_ble")]
@@ -70,21 +149,90 @@ fn report_destination() -> Option<(ConnectionType, &'static ReportChannel)> {
 /// During BLE idle sleep, reports are retained in the BLE queue. This lets the
 /// keyboard processor handle the wake key's release and subsequent input while
 /// the transport reconnects; the new BLE writer drains the ordered reports.
-pub async fn send_hid_report(mut report: Report) {
+pub async fn send_hid_report(report: Report) {
+    let is_mouse = matches!(&report, Report::MouseReport(_));
+    enqueue_hid_report(QueuedReport::new(report), is_mouse).await;
+}
+
+/// Enqueue one native-width relative mouse event. Transport writers own HID
+/// chunking, so the pointing processor never blocks while expanding an i16
+/// delta into many i8 reports.
+pub(crate) async fn send_hid_mouse_report(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
+    enqueue_hid_report(QueuedReport::new_wide_mouse(buttons, x, y, wheel, pan), true).await;
+}
+
+async fn enqueue_hid_report(mut queued_report: QueuedReport, _diag_is_mouse: bool) {
     let Some((transport, ch)) = report_destination() else {
         return;
     };
 
+    #[cfg(feature = "rtt_diag")]
+    let diag_started = Instant::now();
+    #[cfg(feature = "rtt_diag")]
+    let mut diag_full_retries = 0u32;
+
     loop {
-        match ch.try_send(report) {
-            Ok(()) => return,
-            Err(TrySendError::Full(r)) => report = r,
+        match ch.try_send(queued_report) {
+            Ok(()) => {
+                #[cfg(feature = "rtt_diag")]
+                if matches!(transport, ConnectionType::Ble) {
+                    crate::rtt_diag::record_hid_enqueue(
+                        _diag_is_mouse,
+                        ch.len(),
+                        diag_full_retries,
+                        Instant::now().duration_since(diag_started).as_micros() as u32,
+                        true,
+                    );
+                }
+                return;
+            }
+            Err(TrySendError::Full(r)) => {
+                queued_report = r;
+                #[cfg(feature = "rtt_diag")]
+                {
+                    diag_full_retries = diag_full_retries.saturating_add(1);
+                }
+            }
         }
 
         poll_fn(|cx| ch.poll_ready_to_send(cx)).await;
         if crate::state::active_transport() != Some(transport) {
+            #[cfg(feature = "rtt_diag")]
+            if matches!(transport, ConnectionType::Ble) {
+                crate::rtt_diag::record_hid_enqueue(
+                    _diag_is_mouse,
+                    ch.len(),
+                    diag_full_retries,
+                    Instant::now().duration_since(diag_started).as_micros() as u32,
+                    false,
+                );
+            }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{QueuedReport, QueuedReportPayload, WideMouseReport};
+
+    #[test]
+    fn extreme_native_mouse_delta_stays_one_wide_queue_item() {
+        let queued = QueuedReport::new_wide_mouse(3, i16::MAX, i16::MIN, 321, -654);
+
+        let QueuedReportPayload::WideMouse(report) = queued.into_payload() else {
+            panic!("native mouse delta must remain wide while queued");
+        };
+        assert_eq!(
+            report,
+            WideMouseReport {
+                buttons: 3,
+                x: i32::from(i16::MAX),
+                y: i32::from(i16::MIN),
+                wheel: 321,
+                pan: -654,
+            }
+        );
     }
 }
 
@@ -93,7 +241,7 @@ pub async fn send_hid_report(mut report: Report) {
 /// the matrix scan (e.g. steno chord output).
 pub(crate) fn try_send_hid_report(report: Report) {
     if let Some((_, ch)) = active_report_channel() {
-        let _ = ch.try_send(report);
+        let _ = ch.try_send(QueuedReport::new(report));
     }
 }
 
@@ -103,7 +251,7 @@ pub(crate) fn try_send_hid_report(report: Report) {
 pub(crate) fn clear_and_release_report_channel(transport: ConnectionType) {
     if let Some(ch) = report_channel(transport) {
         ch.clear();
-        let _ = ch.try_send(Report::KeyboardReport(KeyboardReport::default()));
+        let _ = ch.try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport::default())));
     }
 }
 

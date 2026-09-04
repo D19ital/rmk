@@ -84,7 +84,10 @@ pub mod keymap;
 pub mod layout_macro;
 pub mod light;
 pub mod matrix;
+pub(crate) mod mouse_chunk;
 pub mod processor;
+#[cfg(feature = "rtt_diag")]
+pub mod rtt_diag;
 #[cfg(feature = "split")]
 pub mod split;
 pub mod state;

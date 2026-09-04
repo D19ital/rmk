@@ -41,7 +41,7 @@ const BURST_MOTION: usize = 0;
 const BURST_DELTA_X_L: usize = 1;
 const BURST_DELTA_Y_L: usize = 2;
 const BURST_DELTA_XY_H: usize = 3;
-const BURST_DELTA_X_H: usize = 4;
+const BURST_SQUAL: usize = 4;
 const BURST_SHUTTER_HI: usize = 5;
 const BURST_SHUTTER_LO: usize = 6;
 
@@ -159,6 +159,34 @@ pub enum Pmw3610Error {
     InvalidCpi,
 }
 
+/// Register snapshot used to reject motion after a PMW3610 power/SPI glitch.
+///
+/// A hot-swappable module can disappear without producing an SPI transport
+/// error: an undriven SDIO line commonly reads as `0xff`.  Keeping both the
+/// observed and expected values lets the keyboard log the state that caused a
+/// recovery before the sensor is reset and configured again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pmw3610Health {
+    pub product_id: u8,
+    pub observation1: u8,
+    pub performance: u8,
+    pub res_step: u8,
+    pub smart_mode: u8,
+    pub expected_performance: u8,
+    pub expected_res_step: u8,
+    pub expected_smart_mode: u8,
+}
+
+impl Pmw3610Health {
+    pub fn is_valid(&self) -> bool {
+        self.product_id == PRODUCT_ID_PMW3610
+            && self.observation1 & OBSERVATION1_INIT_MASK == OBSERVATION1_INIT_MASK
+            && self.performance == self.expected_performance
+            && self.res_step == self.expected_res_step
+            && self.smart_mode & SMART_MODE_DISABLE == self.expected_smart_mode
+    }
+}
+
 impl From<Pmw3610Error> for PointingDriverError {
     fn from(err: Pmw3610Error) -> Self {
         match err {
@@ -207,6 +235,67 @@ impl<SPI: SpiBus, CS: OutputPin, MOTION: InputPin + Wait> Pmw3610<SPI, CS, MOTIO
         configured_registers_valid(product_id, performance)
     }
 
+    /// Read every register that can change motion orientation or tracking
+    /// mode.  The caller must suppress motion until this snapshot is valid.
+    pub async fn configuration_health(&mut self, cpi: u16) -> Result<Pmw3610Health, PointingDriverError> {
+        if !(RES_MIN..=RES_MAX).contains(&cpi) || !cpi.is_multiple_of(RES_STEP) {
+            return Err(PointingDriverError::InvalidCpi);
+        }
+
+        // These registers live on page 0. If the sensor was disconnected in
+        // the middle of a page switch, at least the product ID will fail and
+        // force a full reinitialization.
+        let product_id = self.read_reg(PMW3610_PROD_ID).await?;
+        self.spi_clk_on().await?;
+        let register_result = async {
+            let observation1 = self.read_reg(PMW3610_OBSERVATION1).await?;
+            let performance = self.read_reg(PMW3610_PERFORMANCE).await?;
+            let smart_mode = self.read_reg(PMW3610_SMART_MODE).await?;
+            self.write_reg(PMW3610_SPI_PAGE0, SPI_PAGE0_1).await?;
+            let res_step = self.read_reg(PMW3610_RES_STEP).await?;
+            Ok::<_, Pmw3610Error>((observation1, performance, smart_mode, res_step))
+        }
+        .await;
+        // Always attempt to restore page 0 and release the requested SPI
+        // clock, including when the page-1 read itself failed.
+        let page_restore_result = self.write_reg(PMW3610_SPI_PAGE1, SPI_PAGE1_0).await;
+        let clock_off_result = self.spi_clk_off().await;
+        let (observation1, performance, smart_mode, res_step) = register_result?;
+        page_restore_result?;
+        clock_off_result?;
+
+        let axis_bits = (u8::from(self.config.swap_xy) << RES_STEP_SWAP_XY_BIT)
+            | (u8::from(self.config.invert_x) << RES_STEP_INV_X_BIT)
+            | (u8::from(self.config.invert_y) << RES_STEP_INV_Y_BIT);
+        let expected_res_step = axis_bits | ((cpi / RES_STEP) as u8 & RES_STEP_RES_MASK);
+        let expected_performance = PERFORMANCE_INIT
+            | if self.config.force_awake {
+                PERFORMANCE_FMODE_FORCE_AWAKE
+            } else {
+                PERFORMANCE_FMODE_NORMAL
+            };
+        let expected_smart_mode = if self.config.smart_mode {
+            if self.smart_flag {
+                SMART_MODE_DISABLE
+            } else {
+                SMART_MODE_ENABLE
+            }
+        } else {
+            SMART_MODE_DISABLE
+        };
+
+        Ok(Pmw3610Health {
+            product_id,
+            observation1,
+            performance,
+            res_step,
+            smart_mode,
+            expected_performance,
+            expected_res_step,
+            expected_smart_mode,
+        })
+    }
+
     /// Set force awake mode
     async fn set_force_awake(&mut self, enable: bool) -> Result<(), PointingDriverError> {
         let mut val = self.read_reg(PMW3610_PERFORMANCE).await?;
@@ -221,6 +310,37 @@ impl<SPI: SpiBus, CS: OutputPin, MOTION: InputPin + Wait> Pmw3610<SPI, CS, MOTIO
         self.write_reg(PMW3610_PERFORMANCE, val).await?;
         self.spi_clk_off().await?;
 
+        Ok(())
+    }
+
+    /// Apply the requested smart-register state explicitly and verify it.
+    ///
+    /// PMW3610 powers up with smart tracking enabled. Merely skipping the
+    /// adaptive shutter logic therefore does not disable the sensor feature;
+    /// diagnostic builds need an explicit register write for a valid A/B test.
+    async fn configure_smart_mode(&mut self, enable: bool) -> Result<(), PointingDriverError> {
+        let expected = if enable { SMART_MODE_ENABLE } else { SMART_MODE_DISABLE };
+
+        self.spi_clk_on().await?;
+        self.write_reg(PMW3610_SMART_MODE, expected).await?;
+        let readback = self.read_reg(PMW3610_SMART_MODE).await?;
+        self.spi_clk_off().await?;
+
+        let verified = (readback & SMART_MODE_DISABLE) == expected;
+        #[cfg(feature = "rtt_diag")]
+        info!(
+            "[PMW_SMART_CFG_V14] smart_enabled={} force_awake={} register={:#04x} verified={}",
+            enable, self.config.force_awake, readback, verified
+        );
+        if !verified {
+            error!(
+                "PMW3610 smart-mode register mismatch: expected={:#04x}, got={:#04x}",
+                expected, readback
+            );
+            return Err(PointingDriverError::InitFailed);
+        }
+
+        self.smart_flag = !enable;
         Ok(())
     }
 
@@ -342,6 +462,22 @@ impl<SPI: SpiBus, CS: OutputPin, MOTION: InputPin + Wait> Pmw3610<SPI, CS, MOTIO
         }
 
         self.write_reg(PMW3610_RES_STEP, res_step_val).await?;
+        let res_step_readback = self.read_reg(PMW3610_RES_STEP).await?;
+        let axis_mask = (1 << RES_STEP_SWAP_XY_BIT) | (1 << RES_STEP_INV_X_BIT) | (1 << RES_STEP_INV_Y_BIT);
+        let axis_verified = res_step_readback & axis_mask == res_step_val & axis_mask;
+        #[cfg(feature = "rtt_diag")]
+        info!(
+            "[PMW_AXIS_HW_V14] swap_xy={} invert_x={} invert_y={} register={:#04x} verified={}",
+            self.config.swap_xy, self.config.invert_x, self.config.invert_y, res_step_readback, axis_verified
+        );
+        if !axis_verified {
+            error!(
+                "PMW3610 axis register mismatch: expected={:#04x}, got={:#04x}",
+                res_step_val & axis_mask,
+                res_step_readback & axis_mask
+            );
+            return Err(Pmw3610Error::InitFailed);
+        }
         self.write_reg(PMW3610_SPI_PAGE1, SPI_PAGE1_0).await?;
 
         self.spi_clk_off().await?;
@@ -355,6 +491,9 @@ impl<SPI: SpiBus, CS: OutputPin, MOTION: InputPin + Wait> Pmw3610<SPI, CS, MOTIO
         self.set_force_awake(self.config.force_awake)
             .await
             .map_err(|_| Pmw3610Error::Spi)?;
+        self.configure_smart_mode(self.config.smart_mode)
+            .await
+            .map_err(|_| Pmw3610Error::InitFailed)?;
 
         info!("PMW3610 initialized successfully");
         Ok(())
@@ -393,7 +532,10 @@ where
 
     /// Read motion data from the sensor
     async fn read_motion(&mut self) -> Result<MotionData, PointingDriverError> {
-        let burst_data_len = if self.config.smart_mode {
+        // Keep the full optical burst in RTT diagnostics even when smart mode
+        // is disabled, so 09C remains directly comparable with 09A/09B.
+        let collect_optics = self.config.smart_mode || cfg!(feature = "rtt_diag");
+        let burst_data_len = if collect_optics {
             BURST_DATA_LEN_SMART
         } else {
             BURST_DATA_LEN_NORMAL
@@ -403,7 +545,32 @@ where
         self.read_burst(PMW3610_BURST_READ, &mut burst_data[..burst_data_len])
             .await?;
 
-        if (burst_data[BURST_MOTION] & MOTION_STATUS_MOTION) == 0x00 {
+        let motion_set = (burst_data[BURST_MOTION] & MOTION_STATUS_MOTION) != 0;
+        let _squal = if collect_optics { burst_data[BURST_SQUAL] } else { 0 };
+        let shutter_val = if collect_optics {
+            ((burst_data[BURST_SHUTTER_HI] as u16) << 8) | (burst_data[BURST_SHUTTER_LO] as u16)
+        } else {
+            0
+        };
+        #[cfg(feature = "rtt_diag")]
+        crate::rtt_diag::record_pmw_optics(
+            motion_set,
+            _squal,
+            shutter_val,
+            SHUTTER_SMART_THRESHOLD,
+            self.smart_flag,
+        );
+
+        if !motion_set {
+            #[cfg(feature = "rtt_diag")]
+            crate::rtt_diag::record_pmw_raw(
+                burst_data[BURST_MOTION],
+                burst_data[BURST_DELTA_X_L],
+                burst_data[BURST_DELTA_Y_L],
+                burst_data[BURST_DELTA_XY_H],
+                0,
+                0,
+            );
             return Ok(MotionData::default());
         }
 
@@ -413,9 +580,17 @@ where
         let dx = Self::sign_extend(x, PMW3610_DATA_SIZE_BITS - 1);
         let dy = Self::sign_extend(y, PMW3610_DATA_SIZE_BITS - 1);
 
-        if self.config.smart_mode {
-            let shutter_val = ((burst_data[BURST_SHUTTER_HI] as u16) << 8) | (burst_data[BURST_SHUTTER_LO] as u16);
+        #[cfg(feature = "rtt_diag")]
+        crate::rtt_diag::record_pmw_raw(
+            burst_data[BURST_MOTION],
+            burst_data[BURST_DELTA_X_L],
+            burst_data[BURST_DELTA_Y_L],
+            burst_data[BURST_DELTA_XY_H],
+            dx,
+            dy,
+        );
 
+        if self.config.smart_mode {
             if self.smart_flag && shutter_val < SHUTTER_SMART_THRESHOLD {
                 self.spi_clk_on().await?;
                 self.write_reg(PMW3610_SMART_MODE, SMART_MODE_ENABLE)
@@ -423,6 +598,8 @@ where
                     .map_err(|_| PointingDriverError::Spi)?;
                 self.spi_clk_off().await?;
                 self.smart_flag = false;
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_pmw_smart_transition(false, _squal, shutter_val);
             } else if !self.smart_flag && shutter_val > SHUTTER_SMART_THRESHOLD {
                 self.spi_clk_on().await?;
                 self.write_reg(PMW3610_SMART_MODE, SMART_MODE_DISABLE)
@@ -430,6 +607,8 @@ where
                     .map_err(|_| PointingDriverError::Spi)?;
                 self.spi_clk_off().await?;
                 self.smart_flag = true;
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_pmw_smart_transition(true, _squal, shutter_val);
             }
         }
 
@@ -476,6 +655,19 @@ where
 mod tests {
     use super::*;
 
+    fn healthy_snapshot() -> Pmw3610Health {
+        Pmw3610Health {
+            product_id: PRODUCT_ID_PMW3610,
+            observation1: OBSERVATION1_INIT_MASK,
+            performance: PERFORMANCE_INIT,
+            res_step: 3,
+            smart_mode: SMART_MODE_ENABLE,
+            expected_performance: PERFORMANCE_INIT,
+            expected_res_step: 3,
+            expected_smart_mode: SMART_MODE_ENABLE,
+        }
+    }
+
     #[test]
     fn configured_signature_accepts_power_modes_and_rejects_reset_sensor() {
         assert!(configured_registers_valid(PRODUCT_ID_PMW3610, PERFORMANCE_INIT));
@@ -485,6 +677,31 @@ mod tests {
         ));
         assert!(!configured_registers_valid(0xff, PERFORMANCE_INIT));
         assert!(!configured_registers_valid(PRODUCT_ID_PMW3610, 0));
+    }
+
+    #[test]
+    fn detailed_health_rejects_every_motion_configuration_mismatch() {
+        assert!(healthy_snapshot().is_valid());
+
+        let mut health = healthy_snapshot();
+        health.product_id = 0xff;
+        assert!(!health.is_valid());
+
+        let mut health = healthy_snapshot();
+        health.observation1 = 0;
+        assert!(!health.is_valid());
+
+        let mut health = healthy_snapshot();
+        health.performance = 0;
+        assert!(!health.is_valid());
+
+        let mut health = healthy_snapshot();
+        health.res_step |= 1 << RES_STEP_SWAP_XY_BIT;
+        assert!(!health.is_valid());
+
+        let mut health = healthy_snapshot();
+        health.smart_mode = SMART_MODE_DISABLE;
+        assert!(!health.is_valid());
     }
 }
 

@@ -89,6 +89,7 @@ async fn main(_spawner: Spawner) {
         manufacturer: "Haobo",
         product_name: "RMK Keyboard",
         serial_number: "vial:f64c2b3c:000001",
+        device_release: 0x0010,
     };
 
     let vial_config = VialConfig::new(VIAL_KEYBOARD_ID, VIAL_KEYBOARD_DEF, &[(0, 0), (1, 1)]);

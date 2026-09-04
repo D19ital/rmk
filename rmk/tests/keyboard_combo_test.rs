@@ -759,8 +759,11 @@ fn ongoing_mouse_reports(seq: &'static [(u8, u8, bool, u64)]) -> u32 {
             for _ in 0..6 {
                 match select(Timer::after(Duration::from_millis(50)), USB_REPORT_CHANNEL.receive()).await {
                     Either::First(_) => {}
-                    Either::Second(Report::MouseReport(_)) => count += 1,
-                    Either::Second(_) => {}
+                    Either::Second(queued) => {
+                        if matches!(queued.into_report(), Report::MouseReport(_)) {
+                            count += 1;
+                        }
+                    }
                 }
             }
         })

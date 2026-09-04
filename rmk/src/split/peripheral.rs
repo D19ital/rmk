@@ -1,5 +1,8 @@
 #[cfg(feature = "_ble")]
-use bt_hci::{cmd::le::LeSetPhy, controller::ControllerCmdAsync};
+use bt_hci::{
+    cmd::{le::LeSetPhy, status::ReadRssi},
+    controller::{ControllerCmdAsync, ControllerCmdSync},
+};
 use embassy_futures::select::{Either, select};
 #[cfg(not(feature = "_ble"))]
 use embedded_io_async::{Read, Write};
@@ -36,7 +39,7 @@ use crate::state::update_status;
 pub async fn run_rmk_split_peripheral<
     'b,
     's,
-    #[cfg(feature = "_ble")] C: Controller + ControllerCmdAsync<LeSetPhy>,
+    #[cfg(feature = "_ble")] C: Controller + ControllerCmdAsync<LeSetPhy> + ControllerCmdSync<ReadRssi>,
     #[cfg(not(feature = "_ble"))] S: Write + Read,
 >(
     #[cfg(feature = "_ble")] id: usize,

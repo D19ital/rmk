@@ -1,5 +1,7 @@
 //! Split keyboard events
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use rmk_macro::event;
 
 use super::battery::BatteryStatusEvent;
@@ -31,6 +33,34 @@ pub enum SplitConnectionState {
     Connected,
     /// The configured split search window elapsed.
     Idle,
+}
+
+const SPLIT_STATE_SEARCHING: u8 = 0;
+const SPLIT_STATE_CONNECTED: u8 = 1;
+const SPLIT_STATE_IDLE: u8 = 2;
+
+// Split-state events are edge-triggered, while processors subscribe during
+// asynchronous startup. Keep a sticky snapshot so a fast post-UF2 reconnect
+// cannot leave the LED processor rendering its constructor default forever.
+static CURRENT_SPLIT_CONNECTION_STATE: AtomicU8 = AtomicU8::new(SPLIT_STATE_SEARCHING);
+
+/// Store the authoritative split state before its event is published.
+pub fn set_current_split_connection_state(state: SplitConnectionState) {
+    let raw = match state {
+        SplitConnectionState::Searching => SPLIT_STATE_SEARCHING,
+        SplitConnectionState::Connected => SPLIT_STATE_CONNECTED,
+        SplitConnectionState::Idle => SPLIT_STATE_IDLE,
+    };
+    CURRENT_SPLIT_CONNECTION_STATE.store(raw, Ordering::Release);
+}
+
+/// Read the latest split state even if an edge-triggered event was missed.
+pub fn current_split_connection_state() -> SplitConnectionState {
+    match CURRENT_SPLIT_CONNECTION_STATE.load(Ordering::Acquire) {
+        SPLIT_STATE_CONNECTED => SplitConnectionState::Connected,
+        SPLIT_STATE_IDLE => SplitConnectionState::Idle,
+        _ => SplitConnectionState::Searching,
+    }
 }
 
 /// Split-link acquisition state changed event.

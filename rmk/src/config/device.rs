@@ -11,6 +11,8 @@ pub struct DeviceConfig<'a> {
     pub product_name: &'a str,
     /// Serial number
     pub serial_number: &'a str,
+    /// USB bcdDevice release number reported by the device descriptor.
+    pub device_release: u16,
 }
 
 /// Version string embedded in the USB serial number: `rmk:<version>`.
@@ -33,6 +35,7 @@ impl Default for DeviceConfig<'_> {
             manufacturer: "RMK",
             product_name: "RMK Keyboard",
             serial_number: RMK_BUILD_INFO,
+            device_release: 0x0010,
         }
     }
 }

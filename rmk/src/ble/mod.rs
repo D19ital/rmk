@@ -12,6 +12,7 @@ use rmk_types::led_indicator::LedIndicator;
 use trouble_host::prelude::appearance::human_interface_device::KEYBOARD;
 use trouble_host::prelude::service::{BATTERY, HUMAN_INTERFACE_DEVICE};
 use trouble_host::prelude::*;
+use usbd_hid::descriptor::MouseReport;
 
 use crate::ble::battery_service::BleBatteryServer;
 use crate::ble::ble_server::{BleHidServer, Server};
@@ -24,7 +25,7 @@ use crate::ble::sleep::{
     InputActivityWaiter, report_activity, request_local_sleep, request_sleep, reset_host_power_input,
     take_host_power_input, wait_for_host_power_input,
 };
-use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL};
+use crate::channel::{BLE_REPORT_CHANNEL, LED_SIGNAL, QueuedReportPayload, WideMouseReport};
 use crate::config::{BleBatteryConfig, BleHostPowerConfig, RmkConfig};
 use crate::core_traits::Runnable;
 use crate::event::BleAdvertisingMode;
@@ -47,13 +48,36 @@ pub(crate) const CONNECTIONS_MAX: usize = crate::SPLIT_PERIPHERALS_NUM + 1;
 /// Max number of L2CAP channels
 pub(crate) const L2CAP_CHANNELS_MAX: usize = CONNECTIONS_MAX * 4; // Signal + att + smp + hid
 
-const DIRECTED_RECONNECT_WINDOW_MS: u64 = 1_300;
+// High-duty directed advertising terminates in the controller at roughly
+// 1.28 s. Starting filtered undirected advertising on the same boundary can
+// race that termination and make nrf-sdc return HCI Command Disallowed, then
+// panic. Use the already bond-filtered undirected path from the first packet.
+const DIRECTED_RECONNECT_WINDOW_MS: u64 = 0;
 const FAST_BONDED_RECONNECT_TOTAL_MS: u64 = 5_000;
 const FAST_ADVERTISING_TIMEOUT_SECS: u64 = 30;
 const HOST_PHY_UPDATE_ATTEMPTS: u8 = 3;
 const HOST_PHY_UPDATE_SETTLE_MS: u64 = 80;
 const HOST_CONNECTION_LIVENESS_POLL_MS: u64 = 250;
+const HOST_DISCONNECT_EVENT_TIMEOUT_MS: u64 = 750;
+const HOST_SESSION_RELEASE_GRACE_MS: u64 = 100;
+const HOST_SESSION_RELEASE_SETTLE_MS: u64 = 100;
+const HOST_CONN_PARAM_UPDATE_TIMEOUT_SECS: u64 = 2;
+#[cfg(feature = "host_fixed_15ms")]
+const HOST_FIXED_CONN_PARAM_ATTEMPTS: u8 = 3;
+#[cfg(feature = "host_fixed_15ms")]
+const HOST_FIXED_CONN_PARAM_RETRY_MS: u64 = 250;
 const HID_WRITE_TIMEOUT_SECS: u64 = 2;
+#[cfg(all(
+    feature = "mouse_interval_control",
+    feature = "mouse_vector_preserve",
+    not(feature = "host_fixed_15ms")
+))]
+const MOUSE_CONTROL_INTERVAL: Duration = Duration::from_micros(7_500);
+#[cfg(all(
+    feature = "mouse_interval_control",
+    any(not(feature = "mouse_vector_preserve"), feature = "host_fixed_15ms")
+))]
+const MOUSE_CONTROL_INTERVAL: Duration = Duration::from_millis(15);
 const HOST_IDLE_MAX_LATENCY: u16 = 30;
 const HOST_INTERACTIVE_MAX_LATENCY: u16 = 0;
 const VIAL_LINK_IDLE_TIMEOUT_SECS: u64 = 30;
@@ -65,12 +89,22 @@ const HCI_LINK_UPDATE_RETRY_MS: u64 = 20;
 // before handling controller-level collisions from procedures started by the
 // peer or stack itself.
 static BLE_HCI_LINK_UPDATE_MUTEX: Mutex<crate::RawMutex, ()> = Mutex::new(());
-
 #[cfg(feature = "host")]
 static VIAL_BLE_ACTIVITY: Signal<crate::RawMutex, ()> = Signal::new();
 
 /// Wakes the connected host-power task when a runtime policy changes.
 static HOST_POWER_CONFIG_CHANGED: Signal<crate::RawMutex, ()> = Signal::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostConnParamsSnapshot {
+    interval: Duration,
+    latency: u16,
+}
+
+/// Carries the parameters that the controller actually applied. This lets the
+/// bootstrap task distinguish a host that accepted 7.5 ms from an Apple host
+/// that retained 15 ms and would otherwise keep the preceding slave latency.
+static HOST_CONN_PARAMS_UPDATED: Signal<crate::RawMutex, HostConnParamsSnapshot> = Signal::new();
 
 /// Notify the BLE transport that its runtime host-power policy changed.
 pub fn notify_host_power_config_changed() {
@@ -213,6 +247,7 @@ where
 
         let connection_loop = async {
             let mut resuming_from_sleep = false;
+            let mut session_sequence = 0u32;
             loop {
                 #[cfg(feature = "split")]
                 if let Either::Second(()) = select(
@@ -248,6 +283,15 @@ where
                 .await
                 {
                     Either::First(Ok(conn)) => {
+                        session_sequence = session_sequence.wrapping_add(1);
+                        let session_id = session_sequence;
+                        info!(
+                            "[BLE_SESSION_V15] id={} phase=start raw_connected={} connections_max={} l2cap_max={}",
+                            session_id,
+                            conn.raw().is_connected(),
+                            CONNECTIONS_MAX,
+                            L2CAP_CHANNELS_MAX
+                        );
                         // The wake observer is needed only until advertising
                         // succeeds. Drop both of its PubSub subscribers before
                         // entering a connection that can live for hours.
@@ -332,6 +376,17 @@ where
                                 }
                             }
                         }
+
+                        // A logical GATT exit can precede nrf-sdc's final
+                        // DisconnectionComplete processing by several
+                        // milliseconds. Starting advertising in that gap leaks
+                        // the old ACL/GATT resources and eventually produces a
+                        // permanent OutOfMemory reconnect loop. Do not leave
+                        // this scope until the physical link is down.
+                        ensure_host_session_released(&conn, session_id).await;
+                        drop(conn);
+                        Timer::after_millis(HOST_SESSION_RELEASE_SETTLE_MS).await;
+                        info!("[BLE_SESSION_V15] id={} phase=released", session_id);
                     }
                     Either::First(Err(BleHostError::BleHost(Error::Timeout))) => {
                         // A failed BLE host window must not put the whole
@@ -369,7 +424,9 @@ where
                         #[cfg(feature = "defmt")]
                         let e = defmt::Debug2Format(&e);
                         error!("Advertise error: {:?}", e);
-                        Timer::after_millis(200).await;
+                        // This also rate-limits a controller that is still
+                        // completing the preceding disconnection.
+                        Timer::after_millis(250).await;
                     }
                     Either::Second(()) => {
                         report_activity();
@@ -631,6 +688,10 @@ where
                     peripheral_latency,
                     supervision_timeout.as_millis()
                 );
+                HOST_CONN_PARAMS_UPDATED.signal(HostConnParamsSnapshot {
+                    interval: conn_interval,
+                    latency: peripheral_latency,
+                });
             }
             GattConnectionEvent::RequestConnectionParams(req) => {
                 info!(
@@ -766,6 +827,7 @@ async fn advertise<'a, 'b, C: Controller>(
     }
 
     if let Some(peer) = active_peer {
+        info!("[ADV_GUARD_V13] directed_high_duty=off strategy=filtered_undirected");
         let high_duty_window_ms = bonded_windows.directed_high_duty_ms;
         if high_duty_window_ms > 0 {
             info!("[adv] directed high duty reconnect");
@@ -954,7 +1016,9 @@ struct BondedReconnectWindows {
 }
 
 fn bonded_reconnect_windows(reconnect_timeout_ms: u64) -> BondedReconnectWindows {
-    let directed_high_duty_ms = reconnect_timeout_ms.min(DIRECTED_RECONNECT_WINDOW_MS);
+    // Directed high-duty reconnect is disabled for this profile, so the
+    // reserved window is always zero.
+    let directed_high_duty_ms = DIRECTED_RECONNECT_WINDOW_MS;
     let fast_undirected_ms = reconnect_timeout_ms
         .min(FAST_BONDED_RECONNECT_TOTAL_MS)
         .saturating_sub(directed_high_duty_ms);
@@ -1040,7 +1104,7 @@ fn hid_control_point_action(opcode: u8, local_suspend: bool) -> HidControlPointA
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostConnParamBootstrap {
     Legacy,
-    PreserveNegotiated,
+    BondedRefresh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1053,7 +1117,7 @@ fn host_link_startup_policy(has_active_bond: bool, preserve_bonded_link: bool) -
     if has_active_bond && preserve_bonded_link {
         HostLinkStartupPolicy {
             update_phy: false,
-            conn_params: HostConnParamBootstrap::PreserveNegotiated,
+            conn_params: HostConnParamBootstrap::BondedRefresh,
         }
     } else {
         HostLinkStartupPolicy {
@@ -1110,6 +1174,10 @@ async fn wait_for_vial_activity() {
     core::future::pending::<()>().await;
 }
 
+fn host_power_transition_allowed(active_transport: Option<ConnectionType>) -> bool {
+    active_transport != Some(ConnectionType::Usb)
+}
+
 async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSupportedFeatures>, P: PacketPool>(
     stack: &Stack<'_, C, P>,
     conn: &GattConnection<'a, 'b, P>,
@@ -1122,33 +1190,98 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
     }
 
     match bootstrap {
-        HostConnParamBootstrap::Legacy => {
-            // Wait for 5 seconds before setting connection parameters to avoid
-            // dropping a newly paired connection.
-            Timer::after_secs(5).await;
-
-            // For macOS/iOS (aka Apple devices), both intervals should be 15 ms.
-            // Reference: https://developer.apple.com/accessories/Accessory-Design-Guidelines.pdf
-            update_conn_params(
-                stack,
-                conn.raw(),
-                &host_connection_params(Duration::from_millis(15), HOST_IDLE_MAX_LATENCY),
-            )
-            .await;
-
-            Timer::after_secs(5).await;
-
-            // A second update gives a fresh connection the best performance
-            // on all supported hosts.
-            update_conn_params(
-                stack,
-                conn.raw(),
-                &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
-            )
-            .await;
+        HostConnParamBootstrap::Legacy => info!("Fresh BLE session, applying current host connection parameters"),
+        HostConnParamBootstrap::BondedRefresh => {
+            info!("Bonded BLE session, refreshing host connection parameters")
         }
-        HostConnParamBootstrap::PreserveNegotiated => {
-            info!("Bonded BLE session, preserving host-negotiated connection parameters");
+    }
+
+    #[cfg(feature = "host_fixed_15ms")]
+    {
+        info!("[HOST_DIAG_V9] mode=fixed15 requested_interval_ms=15 requested_latency=0");
+        Timer::after_secs(5).await;
+        let expected = HostConnParamsSnapshot {
+            interval: Duration::from_millis(15),
+            latency: HOST_INTERACTIVE_MAX_LATENCY,
+        };
+        for attempt in 1..=HOST_FIXED_CONN_PARAM_ATTEMPTS {
+            HOST_CONN_PARAMS_UPDATED.reset();
+            update_conn_params(
+                stack,
+                conn.raw(),
+                &host_connection_params(expected.interval, expected.latency),
+            )
+            .await;
+
+            match with_timeout(
+                Duration::from_secs(HOST_CONN_PARAM_UPDATE_TIMEOUT_SECS),
+                HOST_CONN_PARAMS_UPDATED.wait(),
+            )
+            .await
+            {
+                Ok(applied) if applied == expected => {
+                    info!("[HOST_DIAG_V9] confirmed interval_ms=15 latency=0 attempt={}", attempt);
+                    break;
+                }
+                Ok(applied) => warn!(
+                    "[HOST_DIAG_V9] mismatch interval_ms={} latency={} attempt={}",
+                    applied.interval.as_millis(),
+                    applied.latency,
+                    attempt
+                ),
+                Err(_) => warn!("[HOST_DIAG_V9] confirmation_timeout attempt={}", attempt),
+            }
+
+            if attempt < HOST_FIXED_CONN_PARAM_ATTEMPTS {
+                Timer::after_millis(HOST_FIXED_CONN_PARAM_RETRY_MS).await;
+            } else {
+                error!("[HOST_DIAG_V9] fixed15_not_confirmed");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "host_fixed_15ms"))]
+    {
+        // Ported narrowly from upstream RMK #1088. Apple hosts accept the first
+        // 15 ms request; other hosts can accept the later 7.5 ms request. Run the
+        // sequence for bonded sessions too so an old 15 ms bond can be upgraded
+        // without deleting the profile. The delay keeps link-control procedures
+        // away from pairing/encryption and mirrors the upstream timing.
+        let requests = host_bootstrap_connection_requests();
+        for (request_index, (interval, max_latency, supervision_timeout)) in requests.into_iter().enumerate() {
+            Timer::after_secs(5).await;
+            let mut params = host_connection_params(interval, max_latency);
+            params.supervision_timeout = supervision_timeout;
+            HOST_CONN_PARAMS_UPDATED.reset();
+            update_conn_params(stack, conn.raw(), &params).await;
+
+            if request_index == 1 {
+                let applied = with_timeout(
+                    Duration::from_secs(HOST_CONN_PARAM_UPDATE_TIMEOUT_SECS),
+                    HOST_CONN_PARAMS_UPDATED.wait(),
+                )
+                .await
+                .ok();
+
+                if host_requires_apple_safe_fallback(applied) {
+                    match applied {
+                        Some(snapshot) => info!(
+                            "Host retained {:?}ms latency {}; restoring 15ms latency 0",
+                            snapshot.interval.as_millis(),
+                            snapshot.latency
+                        ),
+                        None => info!("No 7.5ms parameter update observed; restoring 15ms latency 0"),
+                    }
+
+                    HOST_CONN_PARAMS_UPDATED.reset();
+                    update_conn_params(
+                        stack,
+                        conn.raw(),
+                        &host_connection_params(Duration::from_millis(15), HOST_INTERACTIVE_MAX_LATENCY),
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -1186,12 +1319,8 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                     last_activity = Instant::now();
                     if idle_connection && !vial_active {
                         info!("Host BLE activity, restoring active connection parameters");
-                        update_conn_params(
-                            stack,
-                            conn.raw(),
-                            &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
-                        )
-                        .await;
+                        update_conn_params(stack, conn.raw(), &host_active_connection_params(HOST_IDLE_MAX_LATENCY))
+                            .await;
                     }
                     idle_connection = false;
                 }
@@ -1207,7 +1336,7 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                         update_conn_params(
                             stack,
                             conn.raw(),
-                            &host_connection_params(Duration::from_micros(7500), HOST_INTERACTIVE_MAX_LATENCY),
+                            &host_active_connection_params(HOST_INTERACTIVE_MAX_LATENCY),
                         )
                         .await;
                     }
@@ -1216,14 +1345,15 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                 }
                 Either4::Fourth(HostPowerTimer::VialIdle) => {
                     vial_active = false;
-                    update_conn_params(
-                        stack,
-                        conn.raw(),
-                        &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
-                    )
-                    .await;
+                    update_conn_params(stack, conn.raw(), &host_active_connection_params(HOST_IDLE_MAX_LATENCY)).await;
                 }
                 Either4::Fourth(HostPowerTimer::Power(HostPowerTransition::EnterIdle)) => {
+                    if !host_power_transition_allowed(crate::state::active_transport()) {
+                        info!("Host BLE idle transition deferred while USB is active");
+                        last_activity = Instant::now();
+                        continue;
+                    }
+
                     info!("Host BLE idle, switching to low-duty connection parameters");
                     update_conn_params(
                         stack,
@@ -1234,6 +1364,12 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                     idle_connection = true;
                 }
                 Either4::Fourth(HostPowerTimer::Power(HostPowerTransition::Disconnect)) => {
+                    if !host_power_transition_allowed(crate::state::active_transport()) {
+                        info!("Host BLE disconnect deferred while USB is active");
+                        last_activity = Instant::now();
+                        continue;
+                    }
+
                     set_ble_state(BleState::Sleeping);
                     request_sleep();
                     return BleKeyboardExit::IdleTimeout;
@@ -1252,7 +1388,7 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
         update_conn_params(
             stack,
             conn.raw(),
-            &host_connection_params(Duration::from_micros(7500), HOST_INTERACTIVE_MAX_LATENCY),
+            &host_active_connection_params(HOST_INTERACTIVE_MAX_LATENCY),
         )
         .await;
 
@@ -1264,12 +1400,7 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
         .is_ok()
         {}
 
-        update_conn_params(
-            stack,
-            conn.raw(),
-            &host_connection_params(Duration::from_micros(7500), HOST_IDLE_MAX_LATENCY),
-        )
-        .await;
+        update_conn_params(stack, conn.raw(), &host_active_connection_params(HOST_IDLE_MAX_LATENCY)).await;
     }
 
     #[cfg(not(feature = "host"))]
@@ -1285,6 +1416,29 @@ fn host_connection_params(interval: Duration, max_latency: u16) -> RequestedConn
         max_event_length: Duration::from_secs(0),
         supervision_timeout: Duration::from_secs(5),
     }
+}
+
+fn host_active_connection_params(max_latency: u16) -> RequestedConnParams {
+    #[cfg(feature = "host_fixed_15ms")]
+    {
+        let _ = max_latency;
+        host_connection_params(Duration::from_millis(15), HOST_INTERACTIVE_MAX_LATENCY)
+    }
+    #[cfg(not(feature = "host_fixed_15ms"))]
+    {
+        host_connection_params(Duration::from_micros(7500), max_latency)
+    }
+}
+
+fn host_bootstrap_connection_requests() -> [(Duration, u16, Duration); 2] {
+    [
+        (Duration::from_millis(15), 30, Duration::from_secs(6)),
+        (Duration::from_micros(7500), 60, Duration::from_secs(6)),
+    ]
+}
+
+fn host_requires_apple_safe_fallback(applied: Option<HostConnParamsSnapshot>) -> bool {
+    applied.is_none_or(|snapshot| snapshot.interval > Duration::from_micros(7500))
 }
 
 /// Seed the battery characteristic before the host can read it.
@@ -1413,6 +1567,10 @@ where
 }
 
 async fn disconnect_and_wait<P: PacketPool>(conn: &GattConnection<'_, '_, P>) {
+    info!(
+        "[BLE_TEARDOWN_V15] phase=request raw_connected={}",
+        conn.raw().is_connected()
+    );
     conn.raw().disconnect();
     let disconnected_event = async {
         loop {
@@ -1422,13 +1580,43 @@ async fn disconnect_and_wait<P: PacketPool>(conn: &GattConnection<'_, '_, P>) {
         }
     };
 
-    // Trouble may drop Disconnected when its bounded event queue is full.
-    // Physical link state is authoritative and prevents teardown hanging.
-    select(
+    // In v14 this returned as soon as is_connected() became false. The host
+    // runner processed DisconnectionComplete roughly 5 ms later, so the next
+    // advertising command raced resource cleanup. Prefer the actual GATT
+    // disconnect event; retain a bounded fallback for an overflowing event
+    // queue, then still wait for the physical flag.
+    match with_timeout(
+        Duration::from_millis(HOST_DISCONNECT_EVENT_TIMEOUT_MS),
         disconnected_event,
-        wait_for_physical_disconnect(|| conn.raw().is_connected()),
     )
-    .await;
+    .await
+    {
+        Ok(()) => info!("[BLE_TEARDOWN_V15] phase=disconnect_event"),
+        Err(_) => warn!("[BLE_TEARDOWN_V15] phase=disconnect_event_timeout"),
+    }
+    wait_for_physical_disconnect(|| conn.raw().is_connected()).await;
+    info!("[BLE_TEARDOWN_V15] phase=physical_down");
+}
+
+async fn ensure_host_session_released<P: PacketPool>(conn: &GattConnection<'_, '_, P>, session_id: u32) {
+    if conn.raw().is_connected() {
+        warn!(
+            "[BLE_SESSION_V15] id={} phase=logical_exit_raw_up waiting_grace",
+            session_id
+        );
+        if with_timeout(
+            Duration::from_millis(HOST_SESSION_RELEASE_GRACE_MS),
+            wait_for_physical_disconnect(|| conn.raw().is_connected()),
+        )
+        .await
+        .is_err()
+        {
+            warn!("[BLE_SESSION_V15] id={} phase=forcing_disconnect", session_id);
+            conn.raw().disconnect();
+            wait_for_physical_disconnect(|| conn.raw().is_connected()).await;
+        }
+    }
+    info!("[BLE_SESSION_V15] id={} phase=physical_down", session_id);
 }
 
 async fn run_ble_communication_tasks<G, C, B, P>(
@@ -1516,29 +1704,350 @@ async fn run_ble_hid_writer<W>(writer: &mut W, fail_closed: bool) -> BleKeyboard
 where
     W: HidWriterTrait<ReportType = crate::hid::Report>,
 {
-    loop {
-        let report = BLE_REPORT_CHANNEL.receive().await;
+    #[cfg(all(feature = "rtt_diag", not(feature = "mouse_interval_control")))]
+    info!("[HID_DIAG_V7] mode=age_gatt_baseline");
+    #[cfg(all(
+        feature = "rtt_diag",
+        feature = "mouse_interval_control",
+        not(feature = "mouse_vector_preserve"),
+        not(feature = "host_fixed_15ms")
+    ))]
+    info!("[HID_DIAG_V8] mode=ble15_axis_diag interval_ms=15 chunk=independent");
+    #[cfg(all(
+        feature = "rtt_diag",
+        feature = "mouse_vector_preserve",
+        not(feature = "host_fixed_15ms")
+    ))]
+    info!(
+        "[HID_DIAG_V22] mode=ble7500_vector_preserve interval_us=7500 chunk=proportional split_source=15ms_i16 windows_per_report=2"
+    );
+    #[cfg(all(
+        feature = "rtt_diag",
+        feature = "mouse_interval_control",
+        not(feature = "mouse_vector_preserve"),
+        feature = "host_fixed_15ms"
+    ))]
+    info!("[HID_DIAG_V9] mode=axis_fixed15 interval_ms=15 latency=0 chunk=independent");
+    #[cfg(all(feature = "rtt_diag", feature = "mouse_vector_preserve", feature = "host_fixed_15ms"))]
+    info!("[HID_DIAG_V9] mode=vector_fixed15 interval_ms=15 latency=0 chunk=proportional");
 
-        if fail_closed {
-            match with_timeout(
-                Duration::from_secs(HID_WRITE_TIMEOUT_SECS),
-                writer.write_report(&report),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    error!("Failed to send BLE HID report: {:?}", e);
-                    return BleKeyboardExit::HidWriteStalled;
+    let mut deferred_report = None;
+    let mut pending_mouse = None;
+    #[cfg(feature = "mouse_interval_control")]
+    let mut next_mouse_slot = None;
+    loop {
+        let mut mouse = if let Some(mouse) = pending_mouse.take() {
+            mouse
+        } else {
+            let queued = if let Some(report) = deferred_report.take() {
+                report
+            } else {
+                BLE_REPORT_CHANNEL.receive().await
+            };
+            let enqueued_at = queued.enqueued_at();
+
+            match queued.into_payload() {
+                QueuedReportPayload::Hid(crate::hid::Report::MouseReport(mouse)) => {
+                    AccumulatedMouseReport::new(mouse, enqueued_at)
                 }
-                Err(_) => {
-                    error!("Timed out sending BLE HID report");
-                    return BleKeyboardExit::HidWriteStalled;
+                QueuedReportPayload::WideMouse(mouse) => AccumulatedMouseReport::new_wide(mouse, enqueued_at),
+                QueuedReportPayload::Hid(report) => {
+                    if let Err(exit) = write_ble_hid_report(writer, &report, fail_closed, None).await {
+                        return exit;
+                    }
+                    continue;
                 }
             }
-        } else if let Err(e) = writer.write_report(&report).await {
-            error!("Failed to send report: {:?}", e);
+        };
+
+        // The control build intentionally offers at most one merged mouse
+        // report per configured host interval. Waiting before draining lets
+        // motion samples accumulate while keyboard/button edges remain
+        // ordering boundaries. The baseline build compiles this block out.
+        #[cfg(feature = "mouse_interval_control")]
+        {
+            let wait_started = Instant::now();
+            if let Some(deadline) = next_mouse_slot {
+                Timer::at(deadline).await;
+            }
+            #[cfg(feature = "rtt_diag")]
+            crate::rtt_diag::record_mouse_slot_wait(Instant::now().duration_since(wait_started).as_micros() as u32);
+            #[cfg(not(feature = "rtt_diag"))]
+            let _ = wait_started;
         }
+
+        // Healthy links send every report immediately (about 125 Hz on K:04).
+        // If the previous GATT write stalled, producers will have queued several
+        // adjacent motion samples; fold those samples into the next report before
+        // writing again. Button edges remain ordering boundaries.
+        let mut merged_reports = 0u32;
+        // A previously deferred button/keyboard edge must stay ahead of any
+        // reports that arrived after it while a large relative delta is being
+        // emitted in multiple HID-sized chunks.
+        if deferred_report.is_none() {
+            while let Ok(queued) = BLE_REPORT_CHANNEL.try_receive() {
+                let mergeable = mouse.can_merge_payload(queued.payload());
+                if mergeable {
+                    let enqueued_at = queued.enqueued_at();
+                    mouse.merge_payload(queued.into_payload(), enqueued_at);
+                    merged_reports = merged_reports.saturating_add(1);
+                } else {
+                    deferred_report = Some(queued);
+                    break;
+                }
+            }
+        }
+
+        let mouse_diag = mouse.take_write_diag();
+        let (mouse_report, chunk_diag) = mouse.take_chunk();
+        #[cfg(not(feature = "rtt_diag"))]
+        let _ = chunk_diag;
+        let report = crate::hid::Report::MouseReport(mouse_report);
+        let has_residual = mouse.has_relative_motion();
+        if has_residual {
+            pending_mouse = Some(mouse);
+        }
+        #[cfg(feature = "rtt_diag")]
+        crate::rtt_diag::record_mouse_coalesce(
+            merged_reports,
+            has_residual,
+            chunk_diag.input_x,
+            chunk_diag.input_y,
+            chunk_diag.residual_x,
+            chunk_diag.residual_y,
+        );
+        #[cfg(feature = "mouse_interval_control")]
+        {
+            next_mouse_slot = Some(Instant::now() + MOUSE_CONTROL_INTERVAL);
+        }
+
+        if let Err(exit) = write_ble_hid_report(writer, &report, fail_closed, Some(mouse_diag)).await {
+            return exit;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MouseWriteDiag {
+    oldest_enqueued_at: Instant,
+    source_reports: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseChunkDiag {
+    input_x: i32,
+    input_y: i32,
+    residual_x: i32,
+    residual_y: i32,
+}
+
+async fn write_ble_hid_report<W>(
+    writer: &mut W,
+    report: &crate::hid::Report,
+    fail_closed: bool,
+    mouse_diag: Option<MouseWriteDiag>,
+) -> Result<(), BleKeyboardExit>
+where
+    W: HidWriterTrait<ReportType = crate::hid::Report>,
+{
+    #[cfg(feature = "rtt_diag")]
+    let diag_started = Instant::now();
+
+    let result = if fail_closed {
+        match with_timeout(Duration::from_secs(HID_WRITE_TIMEOUT_SECS), writer.write_report(report)).await {
+            Ok(result) => result,
+            Err(_) => {
+                #[cfg(feature = "rtt_diag")]
+                record_ble_hid_write_diag(report, diag_started, false, mouse_diag);
+                error!("Timed out sending BLE HID report");
+                return Err(BleKeyboardExit::HidWriteStalled);
+            }
+        }
+    } else {
+        writer.write_report(report).await
+    };
+
+    #[cfg(feature = "rtt_diag")]
+    record_ble_hid_write_diag(report, diag_started, result.is_ok(), mouse_diag);
+
+    #[cfg(not(feature = "rtt_diag"))]
+    let _ = mouse_diag;
+
+    if let Err(e) = result {
+        if fail_closed {
+            error!("Failed to send BLE HID report: {:?}", e);
+            return Err(BleKeyboardExit::HidWriteStalled);
+        }
+        error!("Failed to send report: {:?}", e);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "rtt_diag")]
+fn record_ble_hid_write_diag(
+    report: &crate::hid::Report,
+    started_at: Instant,
+    ok: bool,
+    mouse_diag: Option<MouseWriteDiag>,
+) {
+    let completed_at = Instant::now();
+    let (motion_age_us, source_reports) = mouse_diag
+        .map(|diag| {
+            (
+                completed_at.duration_since(diag.oldest_enqueued_at).as_micros() as u32,
+                diag.source_reports,
+            )
+        })
+        .unwrap_or((0, 0));
+    crate::rtt_diag::record_hid_write(
+        report,
+        completed_at.duration_since(started_at).as_micros() as u32,
+        ok,
+        BLE_REPORT_CHANNEL.len(),
+        motion_age_us,
+        source_reports,
+    );
+}
+
+/// Relative mouse fields are accumulated at a wider width, then emitted in
+/// the minimum number of valid HID-sized chunks. This preserves total motion
+/// without replaying every stale sample individually.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AccumulatedMouseReport {
+    buttons: u8,
+    x: i32,
+    y: i32,
+    wheel: i32,
+    pan: i32,
+    oldest_enqueued_at: Instant,
+    source_reports: u32,
+    preserve_vector: bool,
+}
+
+impl AccumulatedMouseReport {
+    fn new(report: MouseReport, enqueued_at: Instant) -> Self {
+        Self {
+            buttons: report.buttons,
+            x: i32::from(report.x),
+            y: i32::from(report.y),
+            wheel: i32::from(report.wheel),
+            pan: i32::from(report.pan),
+            oldest_enqueued_at: enqueued_at,
+            source_reports: 1,
+            preserve_vector: cfg!(feature = "mouse_vector_preserve"),
+        }
+    }
+
+    fn new_wide(report: WideMouseReport, enqueued_at: Instant) -> Self {
+        Self {
+            buttons: report.buttons,
+            x: report.x,
+            y: report.y,
+            wheel: report.wheel,
+            pan: report.pan,
+            oldest_enqueued_at: enqueued_at,
+            source_reports: 1,
+            // The old pointing path vector-chunked every native i16 event
+            // before enqueueing. Preserve that behavior after moving the
+            // chunking into the transport writer.
+            preserve_vector: true,
+        }
+    }
+
+    fn can_merge(&self, report: &MouseReport) -> bool {
+        self.buttons == report.buttons
+    }
+
+    fn can_merge_payload(&self, payload: &QueuedReportPayload) -> bool {
+        match payload {
+            QueuedReportPayload::Hid(crate::hid::Report::MouseReport(report)) => self.can_merge(report),
+            QueuedReportPayload::WideMouse(report) => self.buttons == report.buttons,
+            QueuedReportPayload::Hid(_) => false,
+        }
+    }
+
+    fn merge(&mut self, report: MouseReport, enqueued_at: Instant) {
+        debug_assert!(self.can_merge(&report));
+        self.x = self.x.saturating_add(i32::from(report.x));
+        self.y = self.y.saturating_add(i32::from(report.y));
+        self.wheel = self.wheel.saturating_add(i32::from(report.wheel));
+        self.pan = self.pan.saturating_add(i32::from(report.pan));
+        self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
+        self.source_reports = self.source_reports.saturating_add(1);
+    }
+
+    fn merge_wide(&mut self, report: WideMouseReport, enqueued_at: Instant) {
+        debug_assert_eq!(self.buttons, report.buttons);
+        self.x = self.x.saturating_add(report.x);
+        self.y = self.y.saturating_add(report.y);
+        self.wheel = self.wheel.saturating_add(report.wheel);
+        self.pan = self.pan.saturating_add(report.pan);
+        self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
+        self.source_reports = self.source_reports.saturating_add(1);
+        self.preserve_vector = true;
+    }
+
+    fn merge_payload(&mut self, payload: QueuedReportPayload, enqueued_at: Instant) {
+        match payload {
+            QueuedReportPayload::Hid(crate::hid::Report::MouseReport(report)) => self.merge(report, enqueued_at),
+            QueuedReportPayload::WideMouse(report) => self.merge_wide(report, enqueued_at),
+            QueuedReportPayload::Hid(_) => unreachable!("non-mouse payload passed the merge boundary"),
+        }
+    }
+
+    fn take_write_diag(&mut self) -> MouseWriteDiag {
+        let diag = MouseWriteDiag {
+            oldest_enqueued_at: self.oldest_enqueued_at,
+            source_reports: self.source_reports,
+        };
+        self.source_reports = 0;
+        diag
+    }
+
+    fn take_chunk(&mut self) -> (MouseReport, MouseChunkDiag) {
+        let input_x = self.x;
+        let input_y = self.y;
+
+        fn take_axis(value: &mut i32) -> i8 {
+            let chunk = (*value).clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            *value -= i32::from(chunk);
+            chunk
+        }
+
+        let vector_chunk = self
+            .preserve_vector
+            .then(|| crate::mouse_chunk::take_vector_chunk(&mut self.x, &mut self.y, &mut self.wheel, &mut self.pan));
+
+        let report = MouseReport {
+            buttons: self.buttons,
+            x: vector_chunk
+                .map(|chunk| chunk.0)
+                .unwrap_or_else(|| take_axis(&mut self.x)),
+            y: vector_chunk
+                .map(|chunk| chunk.1)
+                .unwrap_or_else(|| take_axis(&mut self.y)),
+            wheel: vector_chunk
+                .map(|chunk| chunk.2)
+                .unwrap_or_else(|| take_axis(&mut self.wheel)),
+            pan: vector_chunk
+                .map(|chunk| chunk.3)
+                .unwrap_or_else(|| take_axis(&mut self.pan)),
+        };
+
+        (
+            report,
+            MouseChunkDiag {
+                input_x,
+                input_y,
+                residual_x: self.x,
+                residual_y: self.y,
+            },
+        )
+    }
+
+    fn has_relative_motion(&self) -> bool {
+        self.x != 0 || self.y != 0 || self.wheel != 0 || self.pan != 0
     }
 }
 
@@ -1727,23 +2236,24 @@ mod tests {
     use embassy_futures::join::join;
     use embassy_futures::select::{Either, select};
     use embassy_sync::signal::Signal;
-    use embassy_time::{Duration, Timer};
+    use embassy_time::{Duration, Instant, Timer};
     use rmk_types::battery::{BatteryStatus, ChargeState};
     use rmk_types::ble::{BleState, BleStatus};
     use trouble_host::Error;
     use trouble_host::prelude::{AdvFilterPolicy, PhyKind};
+    use usbd_hid::descriptor::MouseReport;
 
     use super::{
         BleKeyboardExit, BondedReconnectWindows, HidControlPointAction, HostConnParamBootstrap, HostLinkStartupPolicy,
         HostPhyUpdateState, HostPowerTransition, Server, WakeAdvertisingInput, advertising_mode,
         bonded_reconnect_filter_policy, bonded_reconnect_windows, directed_reconnect_should_continue,
-        hid_control_point_action, host_link_startup_policy, host_phy_update_state, is_hci_link_update_busy,
-        join_ble_session_workers, mark_ble_session_ready, next_host_power_transition, pairing_window_timeout_secs,
-        prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer, run_ble_session_workers,
-        run_until_physical_disconnect, seed_battery_level,
+        hid_control_point_action, host_link_startup_policy, host_phy_update_state, host_power_transition_allowed,
+        is_hci_link_update_busy, join_ble_session_workers, mark_ble_session_ready, next_host_power_transition,
+        pairing_window_timeout_secs, prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer,
+        run_ble_session_workers, run_until_physical_disconnect, seed_battery_level,
     };
     use crate::ble::sleep::wait_for_input_activity;
-    use crate::channel::BLE_REPORT_CHANNEL;
+    use crate::channel::{BLE_REPORT_CHANNEL, QueuedReport};
     use crate::config::BleHostPowerConfig;
     use crate::event::{
         Axis, AxisEvent, AxisValType, BleAdvertisingMode, EventSubscriber, KeyboardEvent, PointingEvent,
@@ -1833,12 +2343,12 @@ mod tests {
     }
 
     #[test]
-    fn bonded_reconnect_uses_fast_undirected_until_five_seconds_total() {
+    fn bonded_reconnect_uses_filtered_undirected_from_the_first_packet() {
         assert_eq!(
             bonded_reconnect_windows(10_000),
             BondedReconnectWindows {
-                directed_high_duty_ms: 1_300,
-                fast_undirected_ms: 3_700,
+                directed_high_duty_ms: 0,
+                fast_undirected_ms: 5_000,
                 slow_undirected_ms: 5_000,
             }
         );
@@ -1849,16 +2359,16 @@ mod tests {
         assert_eq!(
             bonded_reconnect_windows(500),
             BondedReconnectWindows {
-                directed_high_duty_ms: 500,
-                fast_undirected_ms: 0,
+                directed_high_duty_ms: 0,
+                fast_undirected_ms: 500,
                 slow_undirected_ms: 0,
             }
         );
         assert_eq!(
             bonded_reconnect_windows(3_000),
             BondedReconnectWindows {
-                directed_high_duty_ms: 1_300,
-                fast_undirected_ms: 1_700,
+                directed_high_duty_ms: 0,
+                fast_undirected_ms: 3_000,
                 slow_undirected_ms: 0,
             }
         );
@@ -1877,8 +2387,8 @@ mod tests {
         assert_eq!(
             bonded_reconnect_windows(u64::MAX),
             BondedReconnectWindows {
-                directed_high_duty_ms: 1_300,
-                fast_undirected_ms: 3_700,
+                directed_high_duty_ms: 0,
+                fast_undirected_ms: 5_000,
                 slow_undirected_ms: u64::MAX - 5_000,
             }
         );
@@ -1896,12 +2406,12 @@ mod tests {
     }
 
     #[test]
-    fn bonded_host_power_session_preserves_the_negotiated_link() {
+    fn bonded_host_power_session_refreshes_params_without_repeating_phy_update() {
         assert_eq!(
             host_link_startup_policy(true, true),
             HostLinkStartupPolicy {
                 update_phy: false,
-                conn_params: HostConnParamBootstrap::PreserveNegotiated,
+                conn_params: HostConnParamBootstrap::BondedRefresh,
             }
         );
     }
@@ -1988,6 +2498,54 @@ mod tests {
         assert_eq!(interactive.max_latency, 0);
         assert_eq!(idle.supervision_timeout, interactive.supervision_timeout);
         assert_eq!(idle.supervision_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn host_bootstrap_requests_apple_safe_then_fast_interval() {
+        let [apple_safe, fast] = super::host_bootstrap_connection_requests();
+
+        assert_eq!(apple_safe, (Duration::from_millis(15), 30, Duration::from_secs(6)));
+        assert_eq!(fast, (Duration::from_micros(7500), 60, Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn host_parameter_fallback_only_when_fast_interval_was_not_applied() {
+        use super::{HostConnParamsSnapshot, host_requires_apple_safe_fallback};
+
+        assert!(!host_requires_apple_safe_fallback(Some(HostConnParamsSnapshot {
+            interval: Duration::from_micros(7500),
+            latency: 60,
+        })));
+        assert!(host_requires_apple_safe_fallback(Some(HostConnParamsSnapshot {
+            interval: Duration::from_millis(15),
+            latency: 30,
+        })));
+        assert!(host_requires_apple_safe_fallback(None));
+    }
+
+    #[cfg(feature = "host_fixed_15ms")]
+    #[test]
+    fn fixed_diagnostic_active_params_ignore_runtime_latency_requests() {
+        let idle = super::host_active_connection_params(super::HOST_IDLE_MAX_LATENCY);
+        let interactive = super::host_active_connection_params(super::HOST_INTERACTIVE_MAX_LATENCY);
+
+        for params in [idle, interactive] {
+            assert_eq!(params.min_connection_interval, Duration::from_millis(15));
+            assert_eq!(params.max_connection_interval, Duration::from_millis(15));
+            assert_eq!(params.max_latency, 0);
+            assert_eq!(params.supervision_timeout, Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn host_power_transitions_are_deferred_only_for_active_usb_output() {
+        assert!(!host_power_transition_allowed(Some(
+            rmk_types::connection::ConnectionType::Usb
+        )));
+        assert!(host_power_transition_allowed(Some(
+            rmk_types::connection::ConnectionType::Ble
+        )));
+        assert!(host_power_transition_allowed(None));
     }
 
     fn ten_minute_disconnect_timeout() -> u64 {
@@ -2131,12 +2689,138 @@ mod tests {
         }
     }
 
+    fn mouse_report(buttons: u8, x: i8, y: i8, wheel: i8, pan: i8) -> MouseReport {
+        MouseReport {
+            buttons,
+            x,
+            y,
+            wheel,
+            pan,
+        }
+    }
+
+    #[test]
+    fn mouse_coalescer_sums_relative_motion_with_unchanged_buttons() {
+        let now = Instant::now();
+        let mut accumulated = super::AccumulatedMouseReport::new(mouse_report(1, 40, -30, 2, 0), now);
+        assert!(accumulated.can_merge(&mouse_report(1, 50, -20, 3, -4)));
+        accumulated.merge(mouse_report(1, 50, -20, 3, -4), now);
+
+        let (chunk, _) = accumulated.take_chunk();
+        assert_eq!(chunk.buttons, 1);
+        assert_eq!((chunk.x, chunk.y, chunk.wheel, chunk.pan), (90, -50, 5, -4));
+        assert!(!accumulated.has_relative_motion());
+    }
+
+    #[test]
+    fn mouse_coalescer_keeps_button_edges_as_ordering_boundaries() {
+        let accumulated = super::AccumulatedMouseReport::new(mouse_report(0, 10, 0, 0, 0), Instant::now());
+        assert!(!accumulated.can_merge(&mouse_report(1, 5, 0, 0, 0)));
+    }
+
+    #[test]
+    fn mouse_coalescer_splits_large_motion_without_losing_distance() {
+        let now = Instant::now();
+        let mut accumulated = super::AccumulatedMouseReport::new(mouse_report(0, 127, -128, 0, 0), now);
+        accumulated.merge(mouse_report(0, 127, -128, 0, 0), now);
+        accumulated.merge(mouse_report(0, 46, -44, 0, 0), now);
+
+        let mut total_x = 0i32;
+        let mut total_y = 0i32;
+        let mut chunks = 0;
+        loop {
+            let (chunk, _) = accumulated.take_chunk();
+            total_x += i32::from(chunk.x);
+            total_y += i32::from(chunk.y);
+            chunks += 1;
+            if !accumulated.has_relative_motion() {
+                break;
+            }
+        }
+
+        assert_eq!((total_x, total_y), (300, -300));
+        assert_eq!(chunks, 3);
+    }
+
+    #[cfg(feature = "mouse_vector_preserve")]
+    #[test]
+    fn mouse_vector_chunks_preserve_asymmetric_direction() {
+        let now = Instant::now();
+        let mut accumulated = super::AccumulatedMouseReport::new(mouse_report(0, -125, 10, 0, 0), now);
+        accumulated.merge(mouse_report(0, -125, 10, 0, 0), now);
+
+        let (first, first_diag) = accumulated.take_chunk();
+        let (second, second_diag) = accumulated.take_chunk();
+
+        assert_eq!((first.x, first.y), (-125, 10));
+        assert_eq!((second.x, second.y), (-125, 10));
+        assert_eq!((first_diag.residual_x, first_diag.residual_y), (-125, 10));
+        assert_eq!((second_diag.residual_x, second_diag.residual_y), (0, 0));
+        assert!(!accumulated.has_relative_motion());
+    }
+
+    #[cfg(feature = "mouse_vector_preserve")]
+    #[test]
+    fn mouse_vector_chunks_distribute_all_quadrants_without_loss() {
+        for (x, y) in [(300, 90), (300, -90), (-300, 90), (-300, -90)] {
+            let now = Instant::now();
+            let mut accumulated = super::AccumulatedMouseReport {
+                buttons: 0,
+                x,
+                y,
+                wheel: 0,
+                pan: 0,
+                oldest_enqueued_at: now,
+                source_reports: 1,
+                preserve_vector: true,
+            };
+            let mut total_x = 0i32;
+            let mut total_y = 0i32;
+            let mut chunks = 0u32;
+            while accumulated.has_relative_motion() {
+                let (chunk, _) = accumulated.take_chunk();
+                total_x += i32::from(chunk.x);
+                total_y += i32::from(chunk.y);
+                chunks += 1;
+            }
+            assert_eq!((total_x, total_y), (x, y));
+            assert_eq!(chunks, 3);
+        }
+    }
+
+    #[test]
+    fn one_extreme_wide_queue_item_preserves_the_complete_delta() {
+        let mut accumulated = super::AccumulatedMouseReport::new_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: i32::from(i16::MAX),
+                y: i32::from(i16::MIN),
+                wheel: 0,
+                pan: 0,
+            },
+            Instant::now(),
+        );
+        let mut total_x = 0i32;
+        let mut total_y = 0i32;
+        let mut chunks = 0u32;
+
+        while accumulated.has_relative_motion() {
+            let (chunk, _) = accumulated.take_chunk();
+            total_x += i32::from(chunk.x);
+            total_y += i32::from(chunk.y);
+            chunks += 1;
+        }
+
+        assert_eq!((total_x, total_y), (i32::from(i16::MAX), i32::from(i16::MIN)));
+        assert_eq!(chunks, 259);
+    }
+
     #[test]
     fn stalled_hid_write_exits_after_bounded_timeout() {
         let _guard = ble_status_test_lock().lock().unwrap();
         BLE_REPORT_CHANNEL.clear();
         BLE_REPORT_CHANNEL
-            .try_send(Report::KeyboardReport(KeyboardReport::default()))
+            .try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport::default())))
             .expect("BLE report channel should have capacity");
 
         let mut writer = PendingBleHidWriter;
@@ -2152,12 +2836,12 @@ mod tests {
         BLE_REPORT_CHANNEL.clear();
         set_ble_state(BleState::Connected);
         BLE_REPORT_CHANNEL
-            .try_send(Report::KeyboardReport(KeyboardReport {
+            .try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport {
                 modifier: 0,
                 reserved: 0,
                 leds: 0,
                 keycodes: [4, 0, 0, 0, 0, 0],
-            }))
+            })))
             .expect("BLE report channel should have capacity");
 
         prepare_hid_write_recovery();
@@ -2165,7 +2849,7 @@ mod tests {
         assert_eq!(current_ble_status().state, BleState::Sleeping);
         assert_eq!(BLE_REPORT_CHANNEL.len(), 1);
         assert!(matches!(
-            BLE_REPORT_CHANNEL.try_receive(),
+            BLE_REPORT_CHANNEL.try_receive().map(QueuedReport::into_report),
             Ok(Report::KeyboardReport(report)) if report.modifier == 0 && report.keycodes == [0; 6]
         ));
 
@@ -2185,17 +2869,17 @@ mod tests {
         set_ble_state(BleState::Sleeping);
         assert!(
             BLE_REPORT_CHANNEL
-                .try_send(Report::KeyboardReport(KeyboardReport {
+                .try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport {
                     modifier: 0,
                     reserved: 0,
                     leds: 0,
                     keycodes: [4, 0, 0, 0, 0, 0],
-                }))
+                })))
                 .is_ok()
         );
         assert!(
             BLE_REPORT_CHANNEL
-                .try_send(Report::KeyboardReport(KeyboardReport::default()))
+                .try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport::default())))
                 .is_ok()
         );
 
@@ -2228,8 +2912,8 @@ mod tests {
         });
 
         assert!(hid_started.get());
-        assert!(matches!(pressed, Report::KeyboardReport(report) if report.keycodes[0] == 4));
-        assert!(matches!(released, Report::KeyboardReport(report) if report.keycodes == [0; 6]));
+        assert!(matches!(pressed.into_report(), Report::KeyboardReport(report) if report.keycodes[0] == 4));
+        assert!(matches!(released.into_report(), Report::KeyboardReport(report) if report.keycodes == [0; 6]));
         assert_eq!(current_ble_status().state, BleState::Connected);
         assert!(BLE_REPORT_CHANNEL.is_empty());
 

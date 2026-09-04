@@ -56,6 +56,7 @@ struct TimedOverlay {
 )]
 pub struct LayerLed {
     led: SequencePwm<'static>,
+    side: u8,
     current_layer: Option<u8>,
     layer_deadline: Option<Instant>,
     current_color: Option<Rgb>,
@@ -71,13 +72,19 @@ pub struct LayerLed {
     latest_battery: Option<u8>,
     pending_battery_display: bool,
     last_low_battery_pulse: Instant,
+    last_vbus_status: Option<(bool, bool)>,
+    #[cfg(feature = "right_uf2_cleanup")]
+    boot_diag_remaining: u8,
+    #[cfg(feature = "right_uf2_cleanup")]
+    next_boot_diag: Instant,
 }
 
 impl LayerLed {
-    pub fn new(led: SequencePwm<'static>) -> Self {
+    pub fn new(led: SequencePwm<'static>, side: u8) -> Self {
         let now = Instant::now();
         Self {
             led,
+            side,
             current_layer: Some(0),
             layer_deadline: None,
             current_color: None,
@@ -86,13 +93,18 @@ impl LayerLed {
             ble_state: BleState::Inactive,
             ble_advertising_mode: BleAdvertisingMode::Pairing,
             ble_snapshot_initialized: false,
-            split_state: SplitConnectionState::Searching,
+            split_state: rmk::event::current_split_connection_state(),
             sleeping: false,
             indicator_phase_started: now,
             overlay: None,
             latest_battery: None,
             pending_battery_display: false,
             last_low_battery_pulse: now,
+            last_vbus_status: None,
+            #[cfg(feature = "right_uf2_cleanup")]
+            boot_diag_remaining: if side == 1 { 3 } else { 0 },
+            #[cfg(feature = "right_uf2_cleanup")]
+            next_boot_diag: now + Duration::from_secs(1),
         }
     }
 
@@ -134,7 +146,7 @@ impl LayerLed {
     }
 
     async fn on_split_connection_state_event(&mut self, event: SplitConnectionStateEvent) {
-        self.set_split_state(event.0);
+        self.set_split_state(event.0, 0);
         self.render(Instant::now()).await;
     }
 
@@ -182,6 +194,15 @@ impl LayerLed {
         self.initialize_ble_snapshot();
         self.expire_overlay(now);
 
+        #[cfg(feature = "right_uf2_cleanup")]
+        {
+            if self.boot_diag_remaining != 0 && now >= self.next_boot_diag {
+                crate::battery_nrf::log_uf2_usb_cleanup_state_v16();
+                self.boot_diag_remaining -= 1;
+                self.next_boot_diag = now + Duration::from_secs(2);
+            }
+        }
+
         if self.overlay.is_none() {
             if !crate::battery_nrf::usb_powered()
                 && self.latest_battery.is_some_and(|level| level <= LOW_BATTERY_MAX)
@@ -220,7 +241,7 @@ impl LayerLed {
         }
     }
 
-    fn set_split_state(&mut self, state: SplitConnectionState) {
+    fn set_split_state(&mut self, state: SplitConnectionState, source: u8) {
         if self.split_state == state {
             if state != SplitConnectionState::Connected {
                 self.overlay = None;
@@ -230,6 +251,7 @@ impl LayerLed {
         let now = Instant::now();
         self.split_state = state;
         self.indicator_phase_started = now;
+        defmt::info!("[SPLIT_LED_V15] side={} source={} state={:?}", self.side, source, state);
         if state == SplitConnectionState::Connected {
             self.start_overlay(Overlay::SplitConnected, indicator_duration());
         } else {
@@ -270,41 +292,66 @@ impl LayerLed {
     }
 
     async fn render(&mut self, now: Instant) {
+        // Split events are edge-triggered. Reconcile with the sticky snapshot
+        // so a fast reconnect during post-UF2 startup cannot leave the LED in
+        // the Searching state after the link is already usable.
+        self.set_split_state(rmk::event::current_split_connection_state(), 1);
+
+        let vbus_status = crate::battery_nrf::usb_power_status();
+        if self.last_vbus_status != Some(vbus_status) {
+            self.last_vbus_status = Some(vbus_status);
+            defmt::info!(
+                "[VBUS_V17] side={} vbus={} outputrdy={} effective={}",
+                self.side,
+                vbus_status.0,
+                vbus_status.1,
+                vbus_status.0
+            );
+        }
+
         self.expire_overlay(now);
-        let color = self.display_color(now);
+        let (color, reason) = self.display_color(now, vbus_status);
 
         if self.current_color == Some(color) {
             return;
         }
         self.current_color = Some(color);
+        defmt::info!(
+            "[LED_V15] side={} reason={} split={:?} rgb=({},{},{})",
+            self.side,
+            reason,
+            self.split_state,
+            color.r,
+            color.g,
+            color.b
+        );
         send_color(&mut self.led, color).await;
     }
 
-    fn display_color(&self, now: Instant) -> Rgb {
-        if self.current_layer == Some(0)
-            && crate::battery_nrf::usb_powered()
-            && module_settings::charge_indicator_enabled()
-        {
-            return if self.latest_battery.is_some_and(|level| level >= CHARGED_BATTERY_MIN) {
-                color_green()
-            } else {
-                color_yellow()
-            };
-        }
-
+    fn display_color(&self, now: Instant, vbus_status: (bool, bool)) -> (Rgb, u8) {
         if self.sleeping {
-            return color_off();
+            return (color_off(), 0);
         }
 
+        // Split acquisition takes priority over charge indication. A cable
+        // used for UF2 must not turn the Searching blink into solid yellow.
         if self.split_state == SplitConnectionState::Searching {
             let elapsed_ms = now.duration_since(self.indicator_phase_started).as_millis();
-            return split_missing_blink_color(elapsed_ms);
+            return (split_missing_blink_color(elapsed_ms), 1);
         }
 
         if let Some(overlay) = self.overlay.filter(|overlay| now < overlay.ends) {
             if is_connection_overlay(overlay.kind) {
-                return overlay_color(overlay);
+                return (overlay_color(overlay), 2);
             }
+        }
+
+        if self.current_layer == Some(0) && vbus_status.0 && module_settings::charge_indicator_enabled() {
+            return if self.latest_battery.is_some_and(|level| level >= CHARGED_BATTERY_MIN) {
+                (color_green(), 3)
+            } else {
+                (color_yellow(), 3)
+            };
         }
 
         // USB_OUT is an explicit host-transport choice. BLE may keep
@@ -316,24 +363,30 @@ impl LayerLed {
             .is_none_or(|status| status.preferred == ConnectionType::Ble);
         if show_host_ble_status {
             if matches!(self.ble_state, BleState::Inactive | BleState::Sleeping) {
-                return color_off();
+                return (color_off(), 4);
             }
 
             if self.ble_state == BleState::Advertising {
                 let elapsed_ms = now.duration_since(self.indicator_phase_started).as_millis();
-                return match self.ble_advertising_mode {
-                    BleAdvertisingMode::Pairing => pairing_blink_color(elapsed_ms),
-                    BleAdvertisingMode::Reconnecting => {
-                        blink_color(color_white(), elapsed_ms, STATUS_BLINK_PERIOD_MS, STATUS_BLINK_ON_MS)
-                    }
-                };
+                return (
+                    match self.ble_advertising_mode {
+                        BleAdvertisingMode::Pairing => pairing_blink_color(elapsed_ms),
+                        BleAdvertisingMode::Reconnecting => {
+                            blink_color(color_white(), elapsed_ms, STATUS_BLINK_PERIOD_MS, STATUS_BLINK_ON_MS)
+                        }
+                    },
+                    5,
+                );
             }
         }
 
-        self.overlay
-            .filter(|overlay| now < overlay.ends)
-            .map(overlay_color)
-            .unwrap_or_else(|| self.layer_color(now))
+        (
+            self.overlay
+                .filter(|overlay| now < overlay.ends)
+                .map(overlay_color)
+                .unwrap_or_else(|| self.layer_color(now)),
+            6,
+        )
     }
 
     fn layer_color(&self, now: Instant) -> Rgb {

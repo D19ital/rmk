@@ -118,18 +118,18 @@ pub async fn run_key_sequence_test<'a>(
                 for expected in expected_reports {
                     match select(Timer::after(Duration::from_secs(2)), USB_REPORT_CHANNEL.receive()).await {
                         Either::First(_) => panic!("ERROR: report wait timeout reached"),
-                        Either::Second(Report::KeyboardReport(report)) => {
-                            report_index += 1;
-                            // println!("Received {}th report from channel: {:?}", report_index, report);
-                            assert_eq!(
-                                *expected, report,
-                                "on #{} reports, expected left but actually right",
-                                report_index
-                            );
-                        }
-                        Either::Second(report) => {
-                            debug!("Other reports {:?}", report)
-                        }
+                        Either::Second(queued) => match queued.into_report() {
+                            Report::KeyboardReport(report) => {
+                                report_index += 1;
+                                // println!("Received {}th report from channel: {:?}", report_index, report);
+                                assert_eq!(
+                                    *expected, report,
+                                    "on #{} reports, expected left but actually right",
+                                    report_index
+                                );
+                            }
+                            report => debug!("Other reports {:?}", report),
+                        },
                     }
                 }
 

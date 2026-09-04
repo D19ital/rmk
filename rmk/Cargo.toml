@@ -111,6 +111,20 @@ cortex-m = { version = "0.7" }
 [features]
 default = ["defmt", "storage", "vial", "vial_lock", "watchdog"]
 
+## Enable low-rate RTT counters for transport latency diagnostics.
+rtt_diag = ["defmt"]
+
+## Pace merged mouse reports to the negotiated BLE HID slot.
+mouse_interval_control = []
+
+## Split oversized relative motion into vector-preserving chunks while
+## retaining BLE pacing from mouse_interval_control.
+mouse_vector_preserve = ["mouse_interval_control"]
+
+## Diagnostic control: keep the active host link at 15 ms / latency 0 so
+## A/B builds cannot diverge through the 7.5 ms bootstrap timing race.
+host_fixed_15ms = []
+
 ## Enable hardware watchdog support
 watchdog = ["rmk-macro/watchdog"]
 
