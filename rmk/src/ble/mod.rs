@@ -2248,10 +2248,9 @@ mod tests {
         HostPhyUpdateState, HostPowerTransition, Server, WakeAdvertisingInput, advertising_mode,
         bonded_reconnect_filter_policy, bonded_reconnect_windows, directed_reconnect_should_continue,
         hid_control_point_action, host_link_startup_policy, host_phy_update_state, host_power_transition_allowed,
-        is_hci_link_update_busy,
-        join_ble_session_workers, mark_ble_session_ready, next_host_power_transition, pairing_window_timeout_secs,
-        prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer, run_ble_session_workers,
-        run_until_physical_disconnect, seed_battery_level,
+        is_hci_link_update_busy, join_ble_session_workers, mark_ble_session_ready, next_host_power_transition,
+        pairing_window_timeout_secs, prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer,
+        run_ble_session_workers, run_until_physical_disconnect, seed_battery_level,
     };
     use crate::ble::sleep::wait_for_input_activity;
     use crate::channel::{BLE_REPORT_CHANNEL, QueuedReport};
