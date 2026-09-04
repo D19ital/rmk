@@ -446,8 +446,8 @@ mapfile -t build_scripts < <(
 )
 for file in "${build_scripts[@]}"; do
     if [[ "$file" == "keyboards/k04/build.rs" ]]; then
-        rg -q 'const STANDALONE_RELEASE_VERSION: &str = "0\.1\.9-rc\.2";' "$file" \
-            || fail "$file: K:04 Standalone release version must be 0.1.9-rc.2"
+        rg -q 'const STANDALONE_RELEASE_VERSION: &str = "0\.1\.9";' "$file" \
+            || fail "$file: K:04 Standalone release version must be 0.1.9"
         rg -q 'const STANDALONE_FIRMWARE_VERSION: &str = "0\.1\.9";' "$file" \
             || fail "$file: K:04 Standalone numeric firmware version must be 0.1.9"
         rg -q 'const STANDALONE_FIRMWARE_VERSION_BCD: &str = "0x0109";' "$file" \
@@ -474,7 +474,7 @@ for file in "${vial_definitions[@]}"; do
     expected_version="0.1.8"
     case "$file" in
         keyboards/k04/vial.json|keyboards/k04/vial_mini.json|keyboards/k04/vial_micro.json)
-            expected_version="0.1.9-rc.2"
+            expected_version="0.1.9"
             ;;
     esac
     jq -e '.manufacturer == "Ergohaven"' "$file" >/dev/null \

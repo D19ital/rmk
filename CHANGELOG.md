@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.1.9
+
+Stable release for the standalone K:04 Series: K:04, K:04 Mini, and K:04 Micro. K:04 Qube profiles and all other keyboards remain on v0.1.8.
+
+### Fixes
+
+- Deferred host-BLE idle and disconnect power transitions while USB is the active output, fixing both K:04 halves freezing after the two-minute idle boundary on wired connections
+
+### Verification
+
+- Reproduced the v0.1.8 wired freeze on physical K:04 hardware, eliminated it with the host-power A/B build, and confirmed the final active-USB guard with a second hardware test
+
 ## v0.1.9-rc.2
 
 Corrective release candidate for the standalone K:04 Series after review of `v0.1.9-rc.1`.

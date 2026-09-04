@@ -1174,6 +1174,10 @@ async fn wait_for_vial_activity() {
     core::future::pending::<()>().await;
 }
 
+fn host_power_transition_allowed(active_transport: Option<ConnectionType>) -> bool {
+    active_transport != Some(ConnectionType::Usb)
+}
+
 async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSupportedFeatures>, P: PacketPool>(
     stack: &Stack<'_, C, P>,
     conn: &GattConnection<'a, 'b, P>,
@@ -1344,6 +1348,12 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                     update_conn_params(stack, conn.raw(), &host_active_connection_params(HOST_IDLE_MAX_LATENCY)).await;
                 }
                 Either4::Fourth(HostPowerTimer::Power(HostPowerTransition::EnterIdle)) => {
+                    if !host_power_transition_allowed(crate::state::active_transport()) {
+                        info!("Host BLE idle transition deferred while USB is active");
+                        last_activity = Instant::now();
+                        continue;
+                    }
+
                     info!("Host BLE idle, switching to low-duty connection parameters");
                     update_conn_params(
                         stack,
@@ -1354,6 +1364,12 @@ async fn set_conn_params<'a, 'b, C: Controller + ControllerCmdSync<LeReadLocalSu
                     idle_connection = true;
                 }
                 Either4::Fourth(HostPowerTimer::Power(HostPowerTransition::Disconnect)) => {
+                    if !host_power_transition_allowed(crate::state::active_transport()) {
+                        info!("Host BLE disconnect deferred while USB is active");
+                        last_activity = Instant::now();
+                        continue;
+                    }
+
                     set_ble_state(BleState::Sleeping);
                     request_sleep();
                     return BleKeyboardExit::IdleTimeout;
@@ -2231,7 +2247,8 @@ mod tests {
         BleKeyboardExit, BondedReconnectWindows, HidControlPointAction, HostConnParamBootstrap, HostLinkStartupPolicy,
         HostPhyUpdateState, HostPowerTransition, Server, WakeAdvertisingInput, advertising_mode,
         bonded_reconnect_filter_policy, bonded_reconnect_windows, directed_reconnect_should_continue,
-        hid_control_point_action, host_link_startup_policy, host_phy_update_state, is_hci_link_update_busy,
+        hid_control_point_action, host_link_startup_policy, host_phy_update_state, host_power_transition_allowed,
+        is_hci_link_update_busy,
         join_ble_session_workers, mark_ble_session_ready, next_host_power_transition, pairing_window_timeout_secs,
         prepare_hid_write_recovery, run_ble_communication_tasks, run_ble_hid_writer, run_ble_session_workers,
         run_until_physical_disconnect, seed_battery_level,
@@ -2519,6 +2536,17 @@ mod tests {
             assert_eq!(params.max_latency, 0);
             assert_eq!(params.supervision_timeout, Duration::from_secs(5));
         }
+    }
+
+    #[test]
+    fn host_power_transitions_are_deferred_only_for_active_usb_output() {
+        assert!(!host_power_transition_allowed(Some(
+            rmk_types::connection::ConnectionType::Usb
+        )));
+        assert!(host_power_transition_allowed(Some(
+            rmk_types::connection::ConnectionType::Ble
+        )));
+        assert!(host_power_transition_allowed(None));
     }
 
     fn ten_minute_disconnect_timeout() -> u64 {
