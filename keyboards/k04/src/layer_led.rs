@@ -146,8 +146,9 @@ impl LayerLed {
     }
 
     async fn on_split_connection_state_event(&mut self, event: SplitConnectionStateEvent) {
-        self.set_split_state(event.0, 0);
-        self.render(Instant::now()).await;
+        let now = Instant::now();
+        self.set_split_state(event.0, now, 0);
+        self.render(now).await;
     }
 
     async fn on_sleep_state_event(&mut self, event: SleepStateEvent) {
@@ -241,14 +242,13 @@ impl LayerLed {
         }
     }
 
-    fn set_split_state(&mut self, state: SplitConnectionState, source: u8) {
+    fn set_split_state(&mut self, state: SplitConnectionState, now: Instant, source: u8) {
         if self.split_state == state {
             if state != SplitConnectionState::Connected {
                 self.overlay = None;
             }
             return;
         }
-        let now = Instant::now();
         self.split_state = state;
         self.indicator_phase_started = now;
         defmt::info!("[SPLIT_LED_V15] side={} source={} state={:?}", self.side, source, state);
@@ -294,8 +294,9 @@ impl LayerLed {
     async fn render(&mut self, now: Instant) {
         // Split events are edge-triggered. Reconcile with the sticky snapshot
         // so a fast reconnect during post-UF2 startup cannot leave the LED in
-        // the Searching state after the link is already usable.
-        self.set_split_state(rmk::event::current_split_connection_state(), 1);
+        // the Searching state after the link is already usable. Use this
+        // render's timestamp so the new phase can never start after `now`.
+        self.set_split_state(rmk::event::current_split_connection_state(), now, 1);
 
         let vbus_status = crate::battery_nrf::usb_power_status();
         if self.last_vbus_status != Some(vbus_status) {
