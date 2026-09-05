@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- Prevented K:04 split LED reconciliation from starting a status phase after the render timestamp, avoiding an `Instant` underflow panic during reconnect
+
 ## v0.1.9
 
 Stable release for the standalone K:04 Series: K:04, K:04 Mini, and K:04 Micro. K:04 Qube profiles and all other keyboards remain on v0.1.8.
