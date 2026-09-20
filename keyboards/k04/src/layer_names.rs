@@ -1,9 +1,18 @@
 use core::str;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 use rmk::config::{VialDeviceSettings, VialDeviceSettingsData};
 use rmk::event::{publish_event, PeripheralSettingsEvent, PeripheralSettingsRefreshEvent};
 use rmk::macros::processor;
+
+use crate::settings_codec::{
+    clamp_auto_layer_timeout_ms, decode_storage_auto_layer_timeout, decode_vial_auto_layer_timeout,
+    encode_storage_auto_layer_timeout, encode_vial_auto_layer_timeout, legacy_auto_layer_timeout_index,
+    legacy_auto_layer_timeout_ms, migrate_v9_module_settings, AUTO_LAYER_TIMEOUT_DEFAULT_MS,
+    MODULE_SETTINGS_ENCODER_PACKET, MODULE_SETTINGS_STORAGE_LEN, MODULE_SETTINGS_STORAGE_LEN_V9,
+    MODULE_SETTINGS_STORAGE_VERSION, MODULE_SETTINGS_STORAGE_VERSION_V9, MODULE_SETTINGS_SYNC_TIMEOUT_HI,
+    MODULE_SETTINGS_SYNC_TIMEOUT_LO, MODULE_SETTINGS_SYNC_VERSION,
+};
 
 pub const LAYER_NAME_COUNT: usize = 16;
 pub const LAYER_NAME_MAX: usize = 12;
@@ -27,10 +36,8 @@ const SETTING_KEYS: [u16; 83] = [
     320, 321, 322, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333, 335,
 ];
 
-const MODULE_SETTINGS_VERSION: u8 = 9;
 const MODULE_SETTINGS_LEN: usize = 45;
 const LEGACY_MODULE_SETTINGS_STORAGE_LEN: usize = 32;
-const MODULE_SETTINGS_STORAGE_LEN: usize = 33;
 const MODULE_SETTINGS_SYNC_LEN: usize = 27;
 const IDX_VERSION: usize = 0;
 const IDX_LEFT_MODE: usize = 1;
@@ -92,7 +99,7 @@ const MODULE_SELECT_TOUCH: u8 = 3;
 
 const MODULE_DEFAULTS: [u8; MODULE_SETTINGS_LEN] = {
     let mut data = [0u8; MODULE_SETTINGS_LEN];
-    data[IDX_VERSION] = MODULE_SETTINGS_VERSION;
+    data[IDX_VERSION] = MODULE_SETTINGS_STORAGE_VERSION;
     data[IDX_LEFT_BALL_DPI] = if cfg!(feature = "production_v22") { 2 } else { 4 };
     data[IDX_RIGHT_BALL_DPI] = if cfg!(feature = "production_v22") { 2 } else { 4 };
     data[IDX_LEFT_TOUCH_DPI] = 3;
@@ -111,7 +118,7 @@ const MODULE_DEFAULTS: [u8; MODULE_SETTINGS_LEN] = {
     data[IDX_LED_TIMEOUT_SEC] = 1;
     // Keep the former 30-minute index for downgrade compatibility.
     data[IDX_RESERVED_HOST_DISCONNECT_TIMEOUT] = 3;
-    data[IDX_AUTO_LAYER_TIMEOUT] = 1;
+    data[IDX_AUTO_LAYER_TIMEOUT] = legacy_auto_layer_timeout_index(AUTO_LAYER_TIMEOUT_DEFAULT_MS);
     data[IDX_LEFT_ENCODER_INTERVAL] = 4;
     data[IDX_RIGHT_ENCODER_INTERVAL] = 4;
     data[IDX_LEFT_ENCODER_STEPS] = 0;
@@ -150,8 +157,7 @@ const _: () = {
     let mut i = 0;
     while i < SETTING_KEYS.len() {
         let qsid = SETTING_KEYS[i];
-        let is_layer_name =
-            qsid >= LAYER_NAME_QSID_BASE && qsid < LAYER_NAME_QSID_BASE + LAYER_NAME_COUNT as u16;
+        let is_layer_name = qsid >= LAYER_NAME_QSID_BASE && qsid < LAYER_NAME_QSID_BASE + LAYER_NAME_COUNT as u16;
         assert!(
             is_layer_name || module_qsid_width(qsid).is_some(),
             "every SETTING_KEYS entry needs a module_qsid_width arm"
@@ -165,6 +171,7 @@ static LAYER_NAME_BYTES: [AtomicU8; LAYER_NAME_COUNT * LAYER_NAME_MAX] =
     [const { AtomicU8::new(0) }; LAYER_NAME_COUNT * LAYER_NAME_MAX];
 static LAYER_NAMES_VERSION: AtomicU8 = AtomicU8::new(0);
 static MODULE_SETTINGS: [AtomicU8; MODULE_SETTINGS_LEN] = [const { AtomicU8::new(0) }; MODULE_SETTINGS_LEN];
+static AUTO_LAYER_TIMEOUT_MS: AtomicU16 = AtomicU16::new(AUTO_LAYER_TIMEOUT_DEFAULT_MS);
 
 pub const fn vial_device_settings() -> VialDeviceSettings<'static> {
     VialDeviceSettings {
@@ -386,6 +393,9 @@ fn layer_index(qsid: u16) -> Option<usize> {
 }
 
 fn module_get_setting(qsid: u16, out: &mut [u8]) -> Option<usize> {
+    if qsid == 324 {
+        return encode_vial_auto_layer_timeout(auto_layer_timeout_ms(), out);
+    }
     let value = module_qsid_value(qsid)?;
     let width = module_qsid_width(qsid)?;
     if out.len() < width {
@@ -400,11 +410,20 @@ const fn module_qsid_width(qsid: u16) -> Option<usize> {
     match qsid {
         120..=152 | 300..=315 | 317..=333 | 335 => Some(1),
         316 => Some(2),
+        324 => Some(if cfg!(feature = "qube") { 2 } else { 1 }),
         _ => None,
     }
 }
 
 fn module_set_setting(qsid: u16, data: &[u8]) -> bool {
+    if qsid == 324 {
+        let Some(timeout_ms) = decode_vial_auto_layer_timeout(data) else {
+            return false;
+        };
+        set_auto_layer_timeout_ms(timeout_ms);
+        publish_module_settings();
+        return true;
+    }
     let value = match data.first() {
         Some(value) => *value,
         None => return false,
@@ -447,7 +466,6 @@ fn module_set_setting(qsid: u16, data: &[u8]) -> bool {
         316 => module_set_byte(IDX_LED_BRIGHTNESS, value),
         317 => module_set_byte(IDX_LED_TIMEOUT_SEC, value),
         318..=322 => module_set_bt_profile_color_index((qsid - 318) as u8, value.min(24)),
-        324 => module_set_byte(IDX_AUTO_LAYER_TIMEOUT, value.min(5)),
         325 => module_set_byte(IDX_LEFT_ENCODER_INTERVAL, value.min(9)),
         326 => module_set_byte(IDX_RIGHT_ENCODER_INTERVAL, value.min(9)),
         327 => module_set_axis_flag(AXIS_FLAG_LEFT_INVERT_SCROLL_X, value != 0),
@@ -493,7 +511,7 @@ impl ModuleSettingsBroadcast {
 #[cfg(not(feature = "qube"))]
 fn module_profile_settings_sync_packet() -> [u8; MODULE_SETTINGS_SYNC_LEN] {
     let mut data = [0u8; MODULE_SETTINGS_SYNC_LEN];
-    data[0] = MODULE_SETTINGS_VERSION | 0x80;
+    data[0] = MODULE_SETTINGS_SYNC_VERSION | 0x80;
     let mut profile = 0u8;
     while profile < 5 {
         data[1 + usize::from(profile)] = module_bt_profile_color_index(profile);
@@ -504,16 +522,19 @@ fn module_profile_settings_sync_packet() -> [u8; MODULE_SETTINGS_SYNC_LEN] {
 
 fn module_encoder_settings_sync_packet() -> [u8; MODULE_SETTINGS_SYNC_LEN] {
     let mut data = [0u8; MODULE_SETTINGS_SYNC_LEN];
-    data[0] = MODULE_SETTINGS_VERSION | 0x40;
+    data[0] = MODULE_SETTINGS_ENCODER_PACKET;
     data[1] = module_byte(IDX_LEFT_ENCODER_STEPS).min(7);
     data[2] = module_byte(IDX_RIGHT_ENCODER_STEPS).min(7);
+    let [lo, hi] = auto_layer_timeout_ms().to_le_bytes();
+    data[MODULE_SETTINGS_SYNC_TIMEOUT_LO] = lo;
+    data[MODULE_SETTINGS_SYNC_TIMEOUT_HI] = hi;
     data
 }
 
 fn module_settings_sync_packet() -> [u8; MODULE_SETTINGS_SYNC_LEN] {
     ensure_module_settings_initialized();
     let mut data = [0u8; MODULE_SETTINGS_SYNC_LEN];
-    data[0] = MODULE_SETTINGS_VERSION;
+    data[0] = MODULE_SETTINGS_SYNC_VERSION;
     data[1] = (module_byte(IDX_LEFT_MODE).min(3) & 0x03)
         | ((module_byte(IDX_RIGHT_MODE).min(3) & 0x03) << 2)
         | ((module_byte(IDX_AUTO_LAYER).min(15) & 0x0f) << 4);
@@ -540,7 +561,8 @@ fn module_settings_sync_packet() -> [u8; MODULE_SETTINGS_SYNC_LEN] {
         layer += 1;
     }
     data[25] = module_byte(IDX_MODULE_SELECT) & 0x0f;
-    data[26] = (module_byte(IDX_AXIS_FLAGS) & 0x0f) | ((module_byte(IDX_AUTO_LAYER_TIMEOUT).min(5) & 0x0f) << 4);
+    data[26] =
+        (module_byte(IDX_AXIS_FLAGS) & 0x0f) | ((legacy_auto_layer_timeout_index(auto_layer_timeout_ms()) & 0x0f) << 4);
     data
 }
 
@@ -583,7 +605,6 @@ fn module_qsid_value(qsid: u16) -> Option<u8> {
         316 => module_byte(IDX_LED_BRIGHTNESS),
         317 => module_byte(IDX_LED_TIMEOUT_SEC),
         318..=322 => module_bt_profile_color_index((qsid - 318) as u8),
-        324 => module_byte(IDX_AUTO_LAYER_TIMEOUT).min(5),
         325 => module_byte(IDX_LEFT_ENCODER_INTERVAL).min(9),
         326 => module_byte(IDX_RIGHT_ENCODER_INTERVAL).min(9),
         327 => module_axis_flag(AXIS_FLAG_LEFT_INVERT_SCROLL_X) as u8,
@@ -601,7 +622,7 @@ fn module_qsid_value(qsid: u16) -> Option<u8> {
 fn serialize_module_settings() -> [u8; MODULE_SETTINGS_STORAGE_LEN] {
     ensure_module_settings_initialized();
     let mut data = [0u8; MODULE_SETTINGS_STORAGE_LEN];
-    data[0] = MODULE_SETTINGS_VERSION;
+    data[0] = MODULE_SETTINGS_STORAGE_VERSION;
     data[1] = (module_byte(IDX_LEFT_MODE).min(3) & 0x03)
         | ((module_byte(IDX_RIGHT_MODE).min(3) & 0x03) << 2)
         | ((module_byte(IDX_AUTO_LAYER).min(15) & 0x0f) << 4);
@@ -633,24 +654,40 @@ fn serialize_module_settings() -> [u8; MODULE_SETTINGS_STORAGE_LEN] {
     }
     data[29] = (module_byte(IDX_RESERVED_HOST_DISCONNECT_TIMEOUT) & 0x0f)
         | ((module_byte(IDX_LEFT_ENCODER_INTERVAL).min(9) & 0x0f) << 4);
-    data[30] =
-        module_byte(IDX_AUTO_LAYER_TIMEOUT).min(5) | ((module_byte(IDX_RIGHT_ENCODER_INTERVAL).min(9) & 0x0f) << 4);
+    data[30] = legacy_auto_layer_timeout_index(auto_layer_timeout_ms())
+        | ((module_byte(IDX_RIGHT_ENCODER_INTERVAL).min(9) & 0x0f) << 4);
     data[31] = (module_byte(IDX_MODULE_SELECT) & 0x0f) | ((module_byte(IDX_AXIS_FLAGS) & 0x0f) << 4);
     data[32] = (module_byte(IDX_LEFT_ENCODER_STEPS).min(7) & 0x0f)
         | ((module_byte(IDX_RIGHT_ENCODER_STEPS).min(7) & 0x0f) << 4);
+    encode_storage_auto_layer_timeout(&mut data, auto_layer_timeout_ms());
     data
 }
 
 fn deserialize_module_settings(data: &[u8]) {
-    if !matches!(
-        data.len(),
-        LEGACY_MODULE_SETTINGS_STORAGE_LEN | MODULE_SETTINGS_STORAGE_LEN
-    ) || data[0] != MODULE_SETTINGS_VERSION
-    {
-        reset_module_settings();
+    if data.len() == MODULE_SETTINGS_STORAGE_LEN && data[0] == MODULE_SETTINGS_STORAGE_VERSION {
+        deserialize_module_settings_current(data);
         return;
     }
+    if data.len() == MODULE_SETTINGS_STORAGE_LEN_V9 && data[0] == MODULE_SETTINGS_STORAGE_VERSION_V9 {
+        let migrated = migrate_v9_module_settings(data.try_into().expect("validated v9 module settings length"));
+        deserialize_module_settings_current(&migrated);
+        return;
+    }
+    if data.len() == LEGACY_MODULE_SETTINGS_STORAGE_LEN && data[0] == MODULE_SETTINGS_STORAGE_VERSION_V9 {
+        deserialize_module_settings_fields(data);
+        set_auto_layer_timeout_ms(legacy_auto_layer_timeout_ms(data[30] & 0x0f));
+        return;
+    }
+    reset_module_settings();
+}
 
+fn deserialize_module_settings_current(data: &[u8]) {
+    deserialize_module_settings_fields(data);
+    let data: &[u8; MODULE_SETTINGS_STORAGE_LEN] = data.try_into().expect("validated module settings length");
+    set_auto_layer_timeout_ms(decode_storage_auto_layer_timeout(data));
+}
+
+fn deserialize_module_settings_fields(data: &[u8]) {
     reset_module_settings();
     MODULE_SETTINGS[IDX_LEFT_MODE].store(data[1] & 0x03, Ordering::Relaxed);
     MODULE_SETTINGS[IDX_RIGHT_MODE].store((data[1] >> 2) & 0x03, Ordering::Relaxed);
@@ -685,7 +722,6 @@ fn deserialize_module_settings(data: &[u8]) {
     }
     MODULE_SETTINGS[IDX_RESERVED_HOST_DISCONNECT_TIMEOUT].store(data[29] & 0x0f, Ordering::Relaxed);
     MODULE_SETTINGS[IDX_LEFT_ENCODER_INTERVAL].store((data[29] >> 4).min(9), Ordering::Relaxed);
-    MODULE_SETTINGS[IDX_AUTO_LAYER_TIMEOUT].store((data[30] & 0x0f).min(5), Ordering::Relaxed);
     MODULE_SETTINGS[IDX_RIGHT_ENCODER_INTERVAL].store((data[30] >> 4).min(9), Ordering::Relaxed);
     MODULE_SETTINGS[IDX_MODULE_SELECT].store(data[31] & 0x0f, Ordering::Relaxed);
     MODULE_SETTINGS[IDX_AXIS_FLAGS].store((data[31] >> 4) & 0x0f, Ordering::Relaxed);
@@ -696,7 +732,7 @@ fn deserialize_module_settings(data: &[u8]) {
 }
 
 fn ensure_module_settings_initialized() {
-    if MODULE_SETTINGS[IDX_VERSION].load(Ordering::Relaxed) == MODULE_SETTINGS_VERSION {
+    if MODULE_SETTINGS[IDX_VERSION].load(Ordering::Relaxed) == MODULE_SETTINGS_STORAGE_VERSION {
         return;
     }
     reset_module_settings();
@@ -706,6 +742,22 @@ fn reset_module_settings() {
     for (idx, value) in MODULE_DEFAULTS.iter().enumerate() {
         MODULE_SETTINGS[idx].store(*value, Ordering::Relaxed);
     }
+    AUTO_LAYER_TIMEOUT_MS.store(AUTO_LAYER_TIMEOUT_DEFAULT_MS, Ordering::Relaxed);
+}
+
+fn auto_layer_timeout_ms() -> u16 {
+    ensure_module_settings_initialized();
+    AUTO_LAYER_TIMEOUT_MS.load(Ordering::Relaxed)
+}
+
+fn set_auto_layer_timeout_ms(value_ms: u16) {
+    // Initialize before storing the standalone preset so a cold first SET is
+    // not overwritten by module_set_byte's lazy defaults. Keep Qube unchanged.
+    #[cfg(not(feature = "qube"))]
+    ensure_module_settings_initialized();
+    let value_ms = clamp_auto_layer_timeout_ms(value_ms);
+    AUTO_LAYER_TIMEOUT_MS.store(value_ms, Ordering::Relaxed);
+    module_set_byte(IDX_AUTO_LAYER_TIMEOUT, legacy_auto_layer_timeout_index(value_ms));
 }
 
 fn module_byte(idx: usize) -> u8 {

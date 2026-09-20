@@ -180,6 +180,10 @@ pub async fn initialize_keymap_and_storage_with_vial<
             && let Ok(Some(data)) = storage.read_device_settings().await
         {
             (device_settings.deserialize)(&data.data[..data.len as usize]);
+            let migrated = (device_settings.serialize)();
+            if migrated != data && storage.write_device_settings(migrated).await.is_err() {
+                error!("Failed to persist migrated Vial device settings");
+            }
         }
 
         let keymap = KeyMap::new_from_storage(data, Some(&mut storage), behavior_config, positional_config).await;

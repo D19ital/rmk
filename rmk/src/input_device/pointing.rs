@@ -671,6 +671,11 @@ const QUBE_TOUCH_RIGHT_BUTTON: u8 = 1 << 1;
 const QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE: [u32; 6] = [250, 500, 750, 1000, 1250, 1500];
 const QUBE_DEFAULT_AUTO_LAYER_TIMEOUT_INDEX: u8 = 1;
 const QUBE_AUTO_FLAG_DEACTIVATE_ON_KEY_BIT: u8 = 7;
+const QUBE_AUTO_LAYER_TIMEOUT_MIN_MS: u16 = 250;
+const QUBE_AUTO_LAYER_TIMEOUT_MAX_MS: u16 = 1500;
+const QUBE_SETTINGS_ENCODER_PACKET: u8 = QUBE_SETTINGS_VERSION | 0x40;
+const QUBE_SETTINGS_TIMEOUT_LO: usize = 3;
+const QUBE_SETTINGS_TIMEOUT_HI: usize = 4;
 const QUBE_FLAG_LEFT_INVERT_SCROLL_Y: u8 = 1 << 0;
 const QUBE_FLAG_RIGHT_INVERT_SCROLL_Y: u8 = 1 << 1;
 const QUBE_FLAG_LEFT_INVERT_TEXT_Y: u8 = 1 << 2;
@@ -715,7 +720,7 @@ struct QubePointingSource {
     kind: QubePointingKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct QubePointingSettings {
     mode: [QubePointingMode; 2],
     ball_axis: [u8; 2],
@@ -727,11 +732,17 @@ struct QubePointingSettings {
     auto_layer: u8,
     auto_flags: u8,
     axis_flags: u8,
-    auto_layer_timeout_index: u8,
+    auto_layer_timeout_ms: u16,
+    auto_layer_timeout_min_ms: u16,
+    auto_layer_timeout_presets: Option<(&'static [u16], u16)>,
 }
 
 impl QubePointingSettings {
     const fn new() -> Self {
+        Self::new_with_auto_layer_timeout_min_ms(QUBE_AUTO_LAYER_TIMEOUT_MIN_MS)
+    }
+
+    const fn new_with_auto_layer_timeout_min_ms(auto_layer_timeout_min_ms: u16) -> Self {
         Self {
             mode: [QubePointingMode::Normal; 2],
             ball_axis: [0; 2],
@@ -743,11 +754,37 @@ impl QubePointingSettings {
             auto_layer: 4,
             auto_flags: 1,
             axis_flags: 0,
-            auto_layer_timeout_index: QUBE_DEFAULT_AUTO_LAYER_TIMEOUT_INDEX,
+            auto_layer_timeout_ms: QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE[QUBE_DEFAULT_AUTO_LAYER_TIMEOUT_INDEX as usize]
+                as u16,
+            auto_layer_timeout_min_ms,
+            auto_layer_timeout_presets: None,
+        }
+    }
+
+    /// Opt in to exact extension-packet presets and a caller-supplied fallback.
+    /// Base v9 packets retain their original six timeout indices.
+    const fn new_with_auto_layer_timeout_presets(presets: &'static [u16], default: u16) -> Self {
+        Self {
+            auto_layer_timeout_ms: default,
+            auto_layer_timeout_presets: Some((presets, default)),
+            ..Self::new()
         }
     }
 
     fn apply_packet(&mut self, data: &[u8; 27]) {
+        if data[0] == QUBE_SETTINGS_ENCODER_PACKET {
+            let timeout_ms = u16::from_le_bytes([data[QUBE_SETTINGS_TIMEOUT_LO], data[QUBE_SETTINGS_TIMEOUT_HI]]);
+            if let Some((presets, default)) = self.auto_layer_timeout_presets {
+                self.auto_layer_timeout_ms = if presets.contains(&timeout_ms) {
+                    timeout_ms
+                } else {
+                    default
+                };
+            } else if (self.auto_layer_timeout_min_ms..=QUBE_AUTO_LAYER_TIMEOUT_MAX_MS).contains(&timeout_ms) {
+                self.auto_layer_timeout_ms = timeout_ms;
+            }
+            return;
+        }
         if data[0] != QUBE_SETTINGS_VERSION {
             return;
         }
@@ -767,7 +804,14 @@ impl QubePointingSettings {
         self.flags = data[11];
         self.auto_flags = data[12];
         self.axis_flags = data[26] & 0x0f;
-        self.auto_layer_timeout_index = (data[26] >> 4).min(5);
+        let timeout_index = usize::from(data[26] >> 4);
+        self.auto_layer_timeout_ms = if let Some((_, default)) = self.auto_layer_timeout_presets {
+            QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE
+                .get(timeout_index)
+                .map_or(default, |&timeout| timeout as u16)
+        } else {
+            QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE[timeout_index.min(5)] as u16
+        };
     }
 
     fn orientation(&self, source: QubePointingSource) -> u8 {
@@ -800,7 +844,7 @@ impl QubePointingSettings {
     }
 
     fn auto_layer_timeout_ms(&self) -> u32 {
-        QUBE_AUTO_LAYER_TIMEOUT_MS_TABLE[usize::from(self.auto_layer_timeout_index.min(5))]
+        u32::from(self.auto_layer_timeout_ms)
     }
 
     fn deactivate_auto_layer_on_key(&self) -> bool {
@@ -914,14 +958,33 @@ pub struct QubePointingModeProcessor<'a> {
 #[cfg(feature = "split")]
 impl<'a> QubePointingModeProcessor<'a> {
     pub fn new(keymap: &'a KeyMap<'a>) -> Self {
+        Self::new_with_auto_layer_timeout_min_ms(keymap, QUBE_AUTO_LAYER_TIMEOUT_MIN_MS)
+    }
+
+    pub fn new_with_auto_layer_timeout_min_ms(keymap: &'a KeyMap<'a>, auto_layer_timeout_min_ms: u16) -> Self {
         Self {
             keymap,
             sides: [QubePointingSideState::new(), QubePointingSideState::new()],
-            settings: QubePointingSettings::new(),
+            settings: QubePointingSettings::new_with_auto_layer_timeout_min_ms(auto_layer_timeout_min_ms),
             active_auto_layer: QUBE_AUTO_LAYER_NONE,
             auto_layer_self_activated: false,
             auto_layer_held_keys: 0,
             last_auto_motion_ms: 0,
+        }
+    }
+
+    /// Opt in to exact timeout presets for extension packets, without rounding.
+    ///
+    /// `default` is the initial timeout and the fallback for a non-member
+    /// extension timeout or an invalid base v9 timeout index. Valid base v9
+    /// indices still map to 250, 500, 750, 1000, 1250 and 1500 ms.
+    /// For standalone K:04, pass
+    /// `&[50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 750, 1000, 1250, 1500]`
+    /// and `500`. Existing constructors keep their range-based behavior.
+    pub fn new_with_auto_layer_timeout_presets(keymap: &'a KeyMap<'a>, presets: &'static [u16], default: u16) -> Self {
+        Self {
+            settings: QubePointingSettings::new_with_auto_layer_timeout_presets(presets, default),
+            ..Self::new(keymap)
         }
     }
 
@@ -2003,6 +2066,225 @@ mod tests {
             );
             assert_eq!(processor.active_auto_layer, TEST_AUTO_LAYER);
         });
+    }
+
+    #[test]
+    fn qube_timeout_sync_prefers_exact_u16_but_keeps_v9_index_fallback() {
+        let mut settings = QubePointingSettings::new();
+        let mut base = [0u8; 27];
+        base[0] = QUBE_SETTINGS_VERSION;
+        base[26] = 3 << 4;
+        settings.apply_packet(&base);
+        assert_eq!(settings.auto_layer_timeout_ms(), 1000);
+
+        let mut exact = [0u8; 27];
+        exact[0] = QUBE_SETTINGS_ENCODER_PACKET;
+        let [lo, hi] = 733u16.to_le_bytes();
+        exact[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+        exact[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+        settings.apply_packet(&exact);
+        assert_eq!(settings.auto_layer_timeout_ms(), 733);
+    }
+
+    #[test]
+    fn qube_timeout_sync_rejects_out_of_range_extension_values() {
+        let mut settings = QubePointingSettings::new();
+        for invalid in [0u16, 1, 5, 249, 1501] {
+            let mut packet = [0u8; 27];
+            packet[0] = QUBE_SETTINGS_ENCODER_PACKET;
+            let [lo, hi] = invalid.to_le_bytes();
+            packet[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+            packet[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+            settings.apply_packet(&packet);
+            assert_eq!(settings.auto_layer_timeout_ms(), 500);
+        }
+
+        let mut packet = [0u8; 27];
+        packet[0] = QUBE_SETTINGS_ENCODER_PACKET;
+        let [lo, hi] = 1500u16.to_le_bytes();
+        packet[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+        packet[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+        settings.apply_packet(&packet);
+        assert_eq!(settings.auto_layer_timeout_ms(), 1500);
+    }
+
+    #[test]
+    fn standalone_timeout_sync_accepts_zero_and_full_u16_contract_range() {
+        let mut settings = QubePointingSettings::new_with_auto_layer_timeout_min_ms(0);
+        for valid in [0u16, 1, 5, 249, 1500] {
+            let mut packet = [0u8; 27];
+            packet[0] = QUBE_SETTINGS_ENCODER_PACKET;
+            let [lo, hi] = valid.to_le_bytes();
+            packet[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+            packet[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+            settings.apply_packet(&packet);
+            assert_eq!(settings.auto_layer_timeout_ms(), u32::from(valid));
+        }
+
+        let mut packet = [0u8; 27];
+        packet[0] = QUBE_SETTINGS_ENCODER_PACKET;
+        let [lo, hi] = 1501u16.to_le_bytes();
+        packet[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+        packet[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+        settings.apply_packet(&packet);
+        assert_eq!(settings.auto_layer_timeout_ms(), 1500);
+    }
+
+    const STANDALONE_TIMEOUT_PRESETS: &[u16] =
+        &[50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 750, 1000, 1250, 1500];
+
+    fn timeout_extension_packet(timeout: u16) -> [u8; 27] {
+        // Nonzero unrelated bytes must not leak into base settings.
+        let mut packet = [0xa5; 27];
+        packet[0] = QUBE_SETTINGS_ENCODER_PACKET;
+        let [lo, hi] = timeout.to_le_bytes();
+        packet[QUBE_SETTINGS_TIMEOUT_LO] = lo;
+        packet[QUBE_SETTINGS_TIMEOUT_HI] = hi;
+        packet
+    }
+
+    fn populated_timeout_settings(mut settings: QubePointingSettings) -> QubePointingSettings {
+        let mut base = [0xa5; 27];
+        base[0] = QUBE_SETTINGS_VERSION;
+        base[1] = 0x79;
+        base[2] = 0xe4;
+        base[5..=10].copy_from_slice(&[3, 5, 7, 9, 11, 13]);
+        base[26] = (3 << 4) | 0x0b;
+        settings.apply_packet(&base);
+        settings
+    }
+
+    #[test]
+    fn standalone_timeout_presets_default_and_all_fourteen_are_exact() {
+        const SETTINGS: QubePointingSettings =
+            QubePointingSettings::new_with_auto_layer_timeout_presets(STANDALONE_TIMEOUT_PRESETS, 500);
+        assert_eq!(SETTINGS.auto_layer_timeout_ms(), 500);
+        let mut settings = populated_timeout_settings(SETTINGS);
+        for &timeout in STANDALONE_TIMEOUT_PRESETS {
+            let mut expected = settings;
+            expected.auto_layer_timeout_ms = timeout;
+            settings.apply_packet(&timeout_extension_packet(timeout));
+            assert_eq!(settings, expected, "preset {timeout} must change only timeout");
+        }
+    }
+
+    #[test]
+    fn standalone_timeout_presets_every_non_member_resets_only_timeout() {
+        let initial = populated_timeout_settings(QubePointingSettings::new_with_auto_layer_timeout_presets(
+            STANDALONE_TIMEOUT_PRESETS,
+            500,
+        ));
+        assert_eq!(initial.auto_layer_timeout_ms(), 1000);
+        let mut expected = initial;
+        expected.auto_layer_timeout_ms = 500;
+        for timeout in 0..=u16::MAX {
+            if !STANDALONE_TIMEOUT_PRESETS.contains(&timeout) {
+                let mut settings = initial;
+                settings.apply_packet(&timeout_extension_packet(timeout));
+                assert_eq!(
+                    settings, expected,
+                    "non-member {timeout} must not round or remain unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standalone_timeout_presets_base_v9_keeps_six_indices_and_defaults_invalid() {
+        for index in 0u8..16 {
+            let mut settings =
+                QubePointingSettings::new_with_auto_layer_timeout_presets(STANDALONE_TIMEOUT_PRESETS, 500);
+            settings.apply_packet(&timeout_extension_packet(50));
+            let mut base = [0xa5; 27];
+            base[0] = QUBE_SETTINGS_VERSION;
+            base[26] = (index << 4) | 0x0b;
+            let mut expected = QubePointingSettings::new();
+            expected.apply_packet(&base);
+            expected.auto_layer_timeout_presets = settings.auto_layer_timeout_presets;
+            expected.auto_layer_timeout_ms = [250, 500, 750, 1000, 1250, 1500]
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(500);
+            settings.apply_packet(&base);
+            assert_eq!(settings, expected, "base index {index} must change only timeout policy");
+        }
+    }
+
+    #[test]
+    fn timeout_presets_use_caller_table_and_default_not_standalone_constants() {
+        let mut settings = QubePointingSettings::new_with_auto_layer_timeout_presets(&[17, 733, 2000], 733);
+        assert_eq!(settings.auto_layer_timeout_ms(), 733);
+        for timeout in [17, 733, 2000] {
+            settings.apply_packet(&timeout_extension_packet(timeout));
+            assert_eq!(settings.auto_layer_timeout_ms(), u32::from(timeout));
+        }
+        settings.apply_packet(&timeout_extension_packet(500));
+        assert_eq!(settings.auto_layer_timeout_ms(), 733);
+        let mut base = [0u8; 27];
+        base[0] = QUBE_SETTINGS_VERSION;
+        settings.apply_packet(&base);
+        assert_eq!(
+            settings.auto_layer_timeout_ms(),
+            250,
+            "v9 indices are not preset indices"
+        );
+        base[26] = 6 << 4;
+        settings.apply_packet(&base);
+        assert_eq!(settings.auto_layer_timeout_ms(), 733);
+    }
+
+    #[test]
+    fn timeout_sync_qube_and_generic_min_preserve_exact_ranges_and_invalid_state() {
+        for (settings, minimum) in [
+            (QubePointingSettings::new(), 250),
+            (QubePointingSettings::new_with_auto_layer_timeout_min_ms(0), 0),
+            (QubePointingSettings::new_with_auto_layer_timeout_min_ms(600), 600),
+        ] {
+            assert_eq!(settings.auto_layer_timeout_ms(), 500);
+            let initial = populated_timeout_settings(settings);
+            for timeout in 0..=u16::MAX {
+                let mut settings = initial;
+                let mut expected = initial;
+                if (minimum..=1500).contains(&timeout) {
+                    expected.auto_layer_timeout_ms = timeout;
+                }
+                settings.apply_packet(&timeout_extension_packet(timeout));
+                assert_eq!(settings, expected, "min {minimum}, timeout {timeout}");
+            }
+            for index in 0u8..16 {
+                let mut settings = initial;
+                let mut base = [0u8; 27];
+                base[0] = QUBE_SETTINGS_VERSION;
+                base[26] = index << 4;
+                settings.apply_packet(&base);
+                assert_eq!(
+                    settings.auto_layer_timeout_ms(),
+                    [250, 500, 750, 1000, 1250, 1500][usize::from(index.min(5))],
+                    "min {minimum}, base index {index} must retain legacy clamp"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_sync_unknown_packet_versions_leave_all_settings_unchanged() {
+        for settings in [
+            QubePointingSettings::new(),
+            QubePointingSettings::new_with_auto_layer_timeout_min_ms(0),
+            QubePointingSettings::new_with_auto_layer_timeout_presets(STANDALONE_TIMEOUT_PRESETS, 500),
+        ] {
+            let initial = populated_timeout_settings(settings);
+            for version in 0..=u8::MAX {
+                if version == QUBE_SETTINGS_VERSION || version == QUBE_SETTINGS_ENCODER_PACKET {
+                    continue;
+                }
+                let mut settings = initial;
+                let mut packet = timeout_extension_packet(0);
+                packet[0] = version;
+                settings.apply_packet(&packet);
+                assert_eq!(settings, initial, "unknown packet version {version}");
+            }
+        }
     }
 
     #[test]
