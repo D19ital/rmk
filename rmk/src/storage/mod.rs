@@ -724,6 +724,13 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
         }
     }
 
+    #[cfg(all(feature = "host", feature = "vial"))]
+    pub(crate) async fn write_device_settings(&mut self, data: config::VialDeviceSettingsData) -> Result<(), ()> {
+        self.store_data(StorageKey::DeviceSettings, &StorageData::DeviceSettings(data))
+            .await
+            .map_err(|e| print_storage_error::<F>(e))
+    }
+
     async fn initialize_storage_with_config(
         &mut self,
         #[cfg(feature = "host")] keymap: &[[[KeyAction; COL]; ROW]; NUM_LAYER],

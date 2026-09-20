@@ -10,6 +10,7 @@ mod default_layer_names;
 mod layer_names;
 mod module_settings;
 mod qube_display;
+mod settings_codec;
 
 const DEFAULT_LAYER_NAMES: [&str; 16] = default_layer_names::STANDARD_WITH_MOUSE;
 

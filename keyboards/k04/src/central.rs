@@ -10,6 +10,7 @@ mod default_layer_names;
 mod layer_led;
 mod layer_names;
 mod module_settings;
+mod settings_codec;
 mod touchpad;
 mod trackball;
 
@@ -81,6 +82,10 @@ mod keyboard_central {
 
     #[register_processor(poll)]
     fn pointing_processor() -> ::rmk::input_device::pointing::QubePointingModeProcessor<'static> {
-        ::rmk::input_device::pointing::QubePointingModeProcessor::new(&keymap)
+        ::rmk::input_device::pointing::QubePointingModeProcessor::new_with_auto_layer_timeout_presets(
+            &keymap,
+            &crate::settings_codec::AUTO_LAYER_TIMEOUT_PRESETS_MS,
+            crate::settings_codec::AUTO_LAYER_TIMEOUT_DEFAULT_MS,
+        )
     }
 }

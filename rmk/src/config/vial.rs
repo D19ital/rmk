@@ -3,7 +3,7 @@
 /// You can generate automatically using [`build.rs`](https://github.com/HaoboGu/rmk/blob/main/examples/use_rust/stm32h7/build.rs).
 pub const VIAL_DEVICE_SETTINGS_MAX_LEN: usize = 224;
 
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct VialDeviceSettingsData {
     pub len: u8,
