@@ -44,6 +44,14 @@ pub(crate) enum SplitMessage {
     Key(KeyboardEvent),
     /// Pointing device event, from peripheral to central
     Pointing(PointingEvent),
+    /// Diagnostic-only pointing envelope.  Raw source time belongs to the
+    /// originating half's clock; `seq` is the cross-device correlation key.
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    PointingV2 {
+        event: PointingEvent,
+        seq: u32,
+        source_us: u32,
+    },
     /// Led state, on/off, from central to peripheral
     LedState(bool),
     /// `ConnectionStatus` snapshot of the central.
@@ -216,6 +224,49 @@ mod tests {
                 assert_eq!(event.axes[2].value, 0);
             }
             _ => panic!("decoded the wrong split-message variant"),
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn sourced_pointing_v2_round_trip_preserves_sequence_and_timestamp() {
+        let event = PointingEvent {
+            device_id: 1,
+            axes: [
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::X,
+                    value: -1234,
+                },
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::Y,
+                    value: 567,
+                },
+                AxisEvent {
+                    typ: AxisValType::Rel,
+                    axis: Axis::Z,
+                    value: 0,
+                },
+            ],
+        };
+        let message = SplitMessage::PointingV2 {
+            event,
+            seq: u32::MAX,
+            source_us: 0x89ab_cdef,
+        };
+        let mut buffer = [0_u8; SPLIT_MESSAGE_MAX_SIZE];
+        let encoded = encode_split_message(&message, &mut buffer).unwrap();
+
+        match postcard::from_bytes::<SplitMessage>(encoded).unwrap() {
+            SplitMessage::PointingV2 { event, seq, source_us } => {
+                assert_eq!(event.device_id, 1);
+                assert_eq!(event.axes[0].value, -1234);
+                assert_eq!(event.axes[1].value, 567);
+                assert_eq!(seq, u32::MAX);
+                assert_eq!(source_us, 0x89ab_cdef);
+            }
+            _ => panic!("decoded the wrong sourced pointing variant"),
         }
     }
 }

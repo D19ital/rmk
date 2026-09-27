@@ -16,6 +16,22 @@ use trouble_host::prelude::service::{BATTERY, HUMAN_INTERFACE_DEVICE};
 use trouble_host::prelude::*;
 use usbd_hid::descriptor::MouseReport;
 
+#[cfg(any(
+    all(feature = "mouse_realtime_age_cap_30ms", feature = "mouse_realtime_burst_budget_3"),
+    all(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_reversal_budget_3"
+    ),
+    all(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ),
+))]
+compile_error!("mouse realtime policies are mutually exclusive");
+
+#[cfg(all(feature = "mouse_bounded_multi_notification_3", feature = "mouse_ble_16bit_report"))]
+compile_error!("B7 burst and B8 16-bit transport are mutually exclusive");
+
 use crate::ble::battery_service::BleBatteryServer;
 use crate::ble::ble_server::{BleHidServer, Server};
 use crate::ble::device_info::{PnPID, VidSource};
@@ -2264,11 +2280,56 @@ where
     info!("[HID_DIAG_V9] mode=axis_fixed15 interval_ms=15 latency=0 chunk=independent");
     #[cfg(all(feature = "rtt_diag", feature = "mouse_vector_preserve", feature = "host_fixed_15ms"))]
     info!("[HID_DIAG_V9] mode=vector_fixed15 interval_ms=15 latency=0 chunk=proportional");
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    info!("[MOUSE_REALTIME_AGE_CAP_V1] age_cap_ms=30 stale_xy=single_proportional commit=after_gatt_ok");
+    #[cfg(feature = "mouse_realtime_burst_budget_3")]
+    info!(
+        "[MOUSE_REALTIME_B2_V1] age_cap_ms=30 stale_xy=proportional_budget vectors=3 cadence_ms=15 commit=after_gatt_ok"
+    );
+    #[cfg(all(
+        feature = "mouse_realtime_reversal_budget_3",
+        not(feature = "mouse_bounded_multi_notification_3")
+    ))]
+    info!(
+        "[MOUSE_REALTIME_B6_V1] policy=ble_diag_only age_cap_ms=30 stale_xy=proportional_budget vectors=3 pacing=one_notification_per_15ms reversal=raw_pre_acceleration_source_sign deadband=100 gesture_idle_us=1000000 confirm=two_consecutive_meaningful_source_reports seq=duplicate_ignore_gap_restart_wrap_ok first_epoch_report=baseline_only residual_cannot_seed=true per_source=true per_axis=true retirement=after_gatt_ok retry=byte_state_identical burst=disabled"
+    );
+    #[cfg(feature = "mouse_bounded_multi_notification_3")]
+    info!(
+        "[MOUSE_REALTIME_B7_V1] policy=ble_diag_only age_cap_ms=30 stale_xy=proportional_budget vectors=3 pacing=one_slot_per_15ms bounded_stack_handoffs_per_stale_epoch=3 sequential=true fresh_residual_burst=false reversal=b6_raw_pre_acceleration_source_sign confirmed_identity=first_second_frozen_until_stack_handoff_ok retirement=after_stack_handoff_ok retry=byte_state_identical hid_delivery_ack=unavailable"
+    );
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    info!(
+        "[MOUSE_REALTIME_B8_V1] policy=ble_diag_only report_id=2 axes=signed_i16_le payload_bytes=7 pacing=one_notification_per_15ms burst=disabled stale_drop=disabled reversal=b6_raw_pre_acceleration_source_sign commit=after_stack_handoff_ok retry=byte_state_identical usb=unchanged"
+    );
 
     let mut deferred_report = None;
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    let mut reversal_memories = [ReversalMemory::default(); 4];
+    #[cfg(not(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    )))]
     let mut pending_mouse = None;
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    let mut retry_chunk_plan = None;
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    let mut pending_mouse = BLE_MOUSE_RETRY.try_take().map(|retry| {
+        retry_chunk_plan = Some(retry.plan);
+        retry.mouse
+    });
     #[cfg(feature = "mouse_interval_control")]
     let mut next_mouse_slot = None;
+    #[cfg(feature = "mouse_bounded_multi_notification_3")]
+    let mut burst_slot = 0u32;
     loop {
         let mut mouse = if let Some(mouse) = pending_mouse.take() {
             mouse
@@ -2282,9 +2343,33 @@ where
 
             match queued.into_payload() {
                 QueuedReportPayload::Hid(crate::hid::Report::MouseReport(mouse)) => {
-                    AccumulatedMouseReport::new(mouse, enqueued_at)
+                    #[allow(unused_mut)]
+                    let mut accumulated = AccumulatedMouseReport::new(mouse, enqueued_at);
+                    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                    accumulated.restore_reversal_memory_and_process_first(
+                        reversal_memories[0],
+                        #[cfg(feature = "rtt_diag")]
+                        None,
+                    );
+                    accumulated
                 }
-                QueuedReportPayload::WideMouse(mouse) => AccumulatedMouseReport::new_wide(mouse, enqueued_at),
+                QueuedReportPayload::WideMouse(mouse) => {
+                    #[cfg(feature = "rtt_diag")]
+                    let source = mouse.source;
+                    #[cfg(all(feature = "mouse_realtime_reversal_budget_3", feature = "rtt_diag"))]
+                    let memory_index = source.map(|meta| usize::from(meta.device_id.min(3))).unwrap_or(0);
+                    #[cfg(all(feature = "mouse_realtime_reversal_budget_3", not(feature = "rtt_diag")))]
+                    let memory_index = 0usize;
+                    #[allow(unused_mut)]
+                    let mut accumulated = AccumulatedMouseReport::new_wide(mouse, enqueued_at);
+                    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                    accumulated.restore_reversal_memory_and_process_first(
+                        reversal_memories[memory_index],
+                        #[cfg(feature = "rtt_diag")]
+                        source,
+                    );
+                    accumulated
+                }
                 QueuedReportPayload::Hid(report) => {
                     if let Err(exit) = write_ble_hid_report(writer, &report, fail_closed, None).await {
                         return exit;
@@ -2324,7 +2409,19 @@ where
         // A previously deferred button/keyboard edge must stay ahead of any
         // reports that arrived after it while a large relative delta is being
         // emitted in multiple HID-sized chunks.
-        if deferred_report.is_none() {
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        let retrying_frozen = retry_chunk_plan.is_some();
+        #[cfg(not(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )))]
+        let retrying_frozen = false;
+        if deferred_report.is_none() && !retrying_frozen {
             while let Ok(queued) = BLE_REPORT_CHANNEL.try_receive() {
                 let mergeable = mouse.can_merge_payload(queued.payload());
                 if mergeable {
@@ -2338,16 +2435,84 @@ where
             }
         }
 
+        #[cfg(not(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )))]
         let mouse_diag = mouse.take_write_diag();
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        let mouse_diag_base = mouse.write_diag();
+        #[cfg(not(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )))]
         let (mouse_report, chunk_diag) = mouse.take_chunk();
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        let chunk_plan = retry_chunk_plan
+            .take()
+            .unwrap_or_else(|| mouse.prepare_chunk(Instant::now()));
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        let (mouse_report, chunk_diag) = (chunk_plan.report, chunk_plan.diag);
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        let mouse_diag = MouseWriteDiag {
+            input_x: chunk_diag.input_x,
+            input_y: chunk_diag.input_y,
+            residual_x: chunk_diag.residual_x,
+            residual_y: chunk_diag.residual_y,
+            ..mouse_diag_base
+        };
         #[cfg(not(feature = "rtt_diag"))]
-        let _ = chunk_diag;
+        let _ = (chunk_diag, mouse_diag);
+        #[cfg(not(feature = "mouse_ble_16bit_report"))]
         let report = crate::hid::Report::MouseReport(mouse_report);
+        #[cfg(feature = "mouse_ble_16bit_report")]
+        let report = crate::hid::BleMouse16Report {
+            buttons: mouse_report.buttons,
+            x: chunk_plan.emitted_x,
+            y: chunk_plan.emitted_y,
+            wheel: mouse_report.wheel,
+            pan: mouse_report.pan,
+        };
+        #[cfg(not(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )))]
         let has_residual = mouse.has_relative_motion();
+        #[cfg(not(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )))]
         if has_residual {
             pending_mouse = Some(mouse);
         }
-        #[cfg(feature = "rtt_diag")]
+        #[cfg(all(
+            feature = "rtt_diag",
+            not(any(
+                feature = "mouse_realtime_age_cap_30ms",
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))
+        ))]
         crate::rtt_diag::record_mouse_coalesce(
             merged_reports,
             has_residual,
@@ -2361,8 +2526,286 @@ where
             next_mouse_slot = Some(Instant::now() + MOUSE_CONTROL_INTERVAL);
         }
 
-        if let Err(exit) = write_ble_hid_report(writer, &report, fail_closed, Some(mouse_diag)).await {
+        #[cfg(feature = "mouse_bounded_multi_notification_3")]
+        {
+            burst_slot = if burst_slot == u32::MAX { 1 } else { burst_slot + 1 };
+        }
+        #[cfg(feature = "mouse_ble_16bit_report")]
+        let b8_write_started = Instant::now();
+        #[cfg(not(feature = "mouse_ble_16bit_report"))]
+        let write_result = write_ble_hid_report(writer, &report, fail_closed, Some(mouse_diag)).await;
+        #[cfg(feature = "mouse_ble_16bit_report")]
+        let write_result = write_ble_mouse16_report(writer, &report, fail_closed).await;
+        #[cfg(feature = "mouse_ble_16bit_report")]
+        let b8_write_us = Instant::now().duration_since(b8_write_started).as_micros() as u32;
+        #[cfg(all(feature = "mouse_ble_16bit_report", not(feature = "rtt_diag")))]
+        let _ = b8_write_us;
+        if let Err(exit) = write_result {
+            #[cfg(all(feature = "mouse_bounded_multi_notification_3", feature = "rtt_diag"))]
+            crate::rtt_diag::record_mouse_burst_notification(
+                burst_slot,
+                1,
+                false,
+                &mouse_report,
+                chunk_diag.residual_x,
+                chunk_diag.residual_y,
+                chunk_plan.remaining_stale_vectors,
+                BLE_REPORT_CHANNEL.len(),
+                5,
+            );
+            #[cfg(all(feature = "mouse_ble_16bit_report", feature = "rtt_diag"))]
+            crate::rtt_diag::record_mouse_b8_handoff(
+                false,
+                &report,
+                chunk_diag.input_x,
+                chunk_diag.input_y,
+                chunk_diag.residual_x,
+                chunk_diag.residual_y,
+                chunk_plan.age_us,
+                mouse_diag.source_reports,
+                mouse_diag.source,
+                b8_write_us,
+                BLE_REPORT_CHANNEL.len(),
+            );
+            #[cfg(any(
+                feature = "mouse_realtime_age_cap_30ms",
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            BLE_MOUSE_RETRY.signal(MouseRetry {
+                mouse,
+                plan: chunk_plan,
+            });
             return exit;
+        }
+        #[cfg(all(feature = "mouse_ble_16bit_report", feature = "rtt_diag"))]
+        crate::rtt_diag::record_mouse_b8_handoff(
+            true,
+            &report,
+            chunk_diag.input_x,
+            chunk_diag.input_y,
+            chunk_diag.residual_x,
+            chunk_diag.residual_y,
+            chunk_plan.age_us,
+            mouse_diag.source_reports,
+            mouse_diag.source,
+            b8_write_us,
+            BLE_REPORT_CHANNEL.len(),
+        );
+        #[cfg(any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        {
+            mouse.commit_chunk(chunk_plan);
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            {
+                let memory = mouse.reversal_memory();
+                reversal_memories[usize::from(memory.device_id.min(3))] = memory;
+            }
+            #[allow(unused_mut)]
+            let mut has_residual = mouse.has_relative_motion();
+            #[cfg(feature = "rtt_diag")]
+            crate::rtt_diag::record_mouse_coalesce(
+                merged_reports,
+                has_residual,
+                chunk_diag.input_x,
+                chunk_diag.input_y,
+                chunk_diag.residual_x,
+                chunk_diag.residual_y,
+            );
+            #[cfg(feature = "rtt_diag")]
+            if chunk_plan.stale_compress {
+                crate::rtt_diag::record_stale_mouse_compress(
+                    chunk_plan.dropped_x,
+                    chunk_plan.dropped_y,
+                    chunk_plan.age_us,
+                );
+            }
+            #[cfg(all(feature = "rtt_diag", feature = "mouse_realtime_reversal_budget_3"))]
+            {
+                if chunk_plan.reversal_write_x {
+                    crate::rtt_diag::record_mouse_reversal_write(
+                        b'x',
+                        chunk_plan.reversal_device_id,
+                        mouse_report.x,
+                        chunk_plan.reversal_first_seq_x,
+                        chunk_plan.reversal_first_us_x,
+                        chunk_plan.reversal_source_seq_x,
+                        chunk_plan.reversal_source_us_x,
+                    );
+                }
+                if chunk_plan.reversal_write_y {
+                    crate::rtt_diag::record_mouse_reversal_write(
+                        b'y',
+                        chunk_plan.reversal_device_id,
+                        mouse_report.y,
+                        chunk_plan.reversal_first_seq_y,
+                        chunk_plan.reversal_first_us_y,
+                        chunk_plan.reversal_source_seq_y,
+                        chunk_plan.reversal_source_us_y,
+                    );
+                }
+                if chunk_plan.reversal_unconfirmed_x {
+                    crate::rtt_diag::record_mouse_reversal_unconfirmed_flush(
+                        b'x',
+                        mouse_report.x,
+                        chunk_plan.reversal_source_seq_x,
+                        chunk_plan.reversal_source_us_x,
+                    );
+                }
+                if chunk_plan.reversal_unconfirmed_y {
+                    crate::rtt_diag::record_mouse_reversal_unconfirmed_flush(
+                        b'y',
+                        mouse_report.y,
+                        chunk_plan.reversal_source_seq_y,
+                        chunk_plan.reversal_source_us_y,
+                    );
+                }
+            }
+            #[cfg(feature = "mouse_bounded_multi_notification_3")]
+            {
+                let mut burst_index = 1u8;
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_mouse_burst_notification(
+                    burst_slot,
+                    burst_index,
+                    true,
+                    &mouse_report,
+                    chunk_diag.residual_x,
+                    chunk_diag.residual_y,
+                    mouse.stale_vectors_remaining,
+                    BLE_REPORT_CHANNEL.len(),
+                    if mouse.stale_vectors_remaining > 0 { 0 } else { 2 },
+                );
+
+                // Only a frozen stale epoch may use the immediate handoffs.
+                // New/fresh residuals retain one notification per 15 ms slot.
+                // No queue items are merged between members, so ordering is
+                // preserved and any HID boundary waits for at most this
+                // compile-time budget of three sequential stack handoffs.
+                while continue_bounded_stale_burst(burst_index, mouse.stale_vectors_remaining) {
+                    burst_index += 1;
+                    let extra_plan = mouse.prepare_chunk(Instant::now());
+                    let extra_report = extra_plan.report;
+                    let extra_diag = extra_plan.diag;
+                    let extra_mouse_diag_base = mouse.write_diag();
+                    let extra_mouse_diag = MouseWriteDiag {
+                        input_x: extra_diag.input_x,
+                        input_y: extra_diag.input_y,
+                        residual_x: extra_diag.residual_x,
+                        residual_y: extra_diag.residual_y,
+                        ..extra_mouse_diag_base
+                    };
+                    let extra_hid_report = crate::hid::Report::MouseReport(extra_report);
+                    if let Err(exit) =
+                        write_ble_hid_report(writer, &extra_hid_report, fail_closed, Some(extra_mouse_diag)).await
+                    {
+                        #[cfg(feature = "rtt_diag")]
+                        crate::rtt_diag::record_mouse_burst_notification(
+                            burst_slot,
+                            burst_index,
+                            false,
+                            &extra_report,
+                            extra_diag.residual_x,
+                            extra_diag.residual_y,
+                            extra_plan.remaining_stale_vectors,
+                            BLE_REPORT_CHANNEL.len(),
+                            5,
+                        );
+                        BLE_MOUSE_RETRY.signal(MouseRetry {
+                            mouse,
+                            plan: extra_plan,
+                        });
+                        return exit;
+                    }
+
+                    mouse.commit_chunk(extra_plan);
+                    let memory = mouse.reversal_memory();
+                    reversal_memories[usize::from(memory.device_id.min(3))] = memory;
+                    has_residual = mouse.has_relative_motion();
+                    #[cfg(feature = "rtt_diag")]
+                    crate::rtt_diag::record_mouse_coalesce(
+                        0,
+                        has_residual,
+                        extra_diag.input_x,
+                        extra_diag.input_y,
+                        extra_diag.residual_x,
+                        extra_diag.residual_y,
+                    );
+                    #[cfg(feature = "rtt_diag")]
+                    if extra_plan.stale_compress {
+                        crate::rtt_diag::record_stale_mouse_compress(
+                            extra_plan.dropped_x,
+                            extra_plan.dropped_y,
+                            extra_plan.age_us,
+                        );
+                    }
+                    #[cfg(feature = "rtt_diag")]
+                    {
+                        if extra_plan.reversal_write_x {
+                            crate::rtt_diag::record_mouse_reversal_write(
+                                b'x',
+                                extra_plan.reversal_device_id,
+                                extra_report.x,
+                                extra_plan.reversal_first_seq_x,
+                                extra_plan.reversal_first_us_x,
+                                extra_plan.reversal_source_seq_x,
+                                extra_plan.reversal_source_us_x,
+                            );
+                        }
+                        if extra_plan.reversal_write_y {
+                            crate::rtt_diag::record_mouse_reversal_write(
+                                b'y',
+                                extra_plan.reversal_device_id,
+                                extra_report.y,
+                                extra_plan.reversal_first_seq_y,
+                                extra_plan.reversal_first_us_y,
+                                extra_plan.reversal_source_seq_y,
+                                extra_plan.reversal_source_us_y,
+                            );
+                        }
+                        if extra_plan.reversal_unconfirmed_x {
+                            crate::rtt_diag::record_mouse_reversal_unconfirmed_flush(
+                                b'x',
+                                extra_report.x,
+                                extra_plan.reversal_source_seq_x,
+                                extra_plan.reversal_source_us_x,
+                            );
+                        }
+                        if extra_plan.reversal_unconfirmed_y {
+                            crate::rtt_diag::record_mouse_reversal_unconfirmed_flush(
+                                b'y',
+                                extra_report.y,
+                                extra_plan.reversal_source_seq_y,
+                                extra_plan.reversal_source_us_y,
+                            );
+                        }
+                    }
+                    #[cfg(feature = "rtt_diag")]
+                    crate::rtt_diag::record_mouse_burst_notification(
+                        burst_slot,
+                        burst_index,
+                        true,
+                        &extra_report,
+                        extra_diag.residual_x,
+                        extra_diag.residual_y,
+                        mouse.stale_vectors_remaining,
+                        BLE_REPORT_CHANNEL.len(),
+                        if burst_index == 3 {
+                            1
+                        } else if mouse.stale_vectors_remaining > 0 {
+                            0
+                        } else {
+                            2
+                        },
+                    );
+                }
+            }
+            if has_residual {
+                pending_mouse = Some(mouse);
+            }
         }
         #[cfg(feature = "fixed_mouse_pacing_15ms")]
         {
@@ -2373,10 +2816,21 @@ where
     }
 }
 
+#[cfg(feature = "mouse_bounded_multi_notification_3")]
+fn continue_bounded_stale_burst(index: u8, stale_vectors_remaining: u8) -> bool {
+    index < 3 && stale_vectors_remaining > 0
+}
+
 #[derive(Clone, Copy)]
 struct MouseWriteDiag {
     oldest_enqueued_at: Instant,
     source_reports: u32,
+    input_x: i32,
+    input_y: i32,
+    residual_x: i32,
+    residual_y: i32,
+    #[cfg(feature = "rtt_diag")]
+    source: Option<crate::rtt_diag::MouseSourceMeta>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2385,6 +2839,38 @@ struct MouseChunkDiag {
     input_y: i32,
     residual_x: i32,
     residual_y: i32,
+}
+
+#[cfg(feature = "mouse_ble_16bit_report")]
+async fn write_ble_mouse16_report<W>(
+    writer: &mut W,
+    report: &crate::hid::BleMouse16Report,
+    fail_closed: bool,
+) -> Result<(), BleKeyboardExit>
+where
+    W: HidWriterTrait<ReportType = crate::hid::Report>,
+{
+    let result = if fail_closed {
+        match with_timeout(
+            Duration::from_secs(HID_WRITE_TIMEOUT_SECS),
+            writer.write_ble_mouse16_report(report),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                error!("Timed out sending BLE 16-bit mouse report");
+                return Err(BleKeyboardExit::HidWriteStalled);
+            }
+        }
+    } else {
+        writer.write_ble_mouse16_report(report).await
+    };
+    if let Err(e) = result {
+        error!("Failed to send BLE 16-bit mouse report: {:?}", e);
+        return Err(BleKeyboardExit::HidWriteStalled);
+    }
+    Ok(())
 }
 
 async fn write_ble_hid_report<W>(
@@ -2420,7 +2906,13 @@ where
     let _ = mouse_diag;
 
     if let Err(e) = result {
-        if fail_closed {
+        if fail_closed
+            || cfg!(any(
+                feature = "mouse_realtime_age_cap_30ms",
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))
+        {
             error!("Failed to send BLE HID report: {:?}", e);
             return Err(BleKeyboardExit::HidWriteStalled);
         }
@@ -2453,6 +2945,8 @@ fn record_ble_hid_write_diag(
         BLE_REPORT_CHANNEL.len(),
         motion_age_us,
         source_reports,
+        mouse_diag.map(|diag| (diag.input_x, diag.input_y, diag.residual_x, diag.residual_y)),
+        mouse_diag.and_then(|diag| diag.source),
     );
 }
 
@@ -2469,6 +2963,193 @@ struct AccumulatedMouseReport {
     oldest_enqueued_at: Instant,
     source_reports: u32,
     preserve_vector: bool,
+    #[cfg(feature = "rtt_diag")]
+    source: Option<crate::rtt_diag::MouseSourceMeta>,
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    stale_vectors_remaining: u8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_candidate: i32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_candidate: i32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_samples: u8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_samples: u8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_write_pending: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_write_pending: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_direction: i8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_direction: i8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_source_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_source_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_source_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_source_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_confirmed_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_confirmed_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_confirmed_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_confirmed_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_first_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_first_seq: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_first_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_first_us: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_x_candidate_flushed: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_y_candidate_flushed: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_device_id: u8,
+}
+
+/// Symmetric source-space deadband selected from B3/B4 captures. B3 false
+/// candidates topped out at 70 counts; all 16 B4 physical reversal entries
+/// began at 110 counts or above (median 139). A 100-count threshold preserves
+/// all 16 entries with 30 counts of observed noise margin and remains below
+/// the clipped local +127 boundary, giving i8 and wide i16 sources one rule.
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+const REVERSAL_SOURCE_DEADBAND: u32 = 100;
+
+/// A source axis starts a new gesture after one second without a meaningful
+/// raw report.  Across all eight B5 hardware streams, the largest inactivity
+/// that must remain inside a genuine reversal epoch was 848,541 us; the
+/// smallest pre-main idle involved in a false confirmation was 8,387,451 us.
+/// Thus 1 s lies inside the replay-proven inclusive safe range
+/// 848,542..=8,387,451 us with margin on both observed boundaries.
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+const REVERSAL_GESTURE_IDLE_US: u32 = 1_000_000;
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+const REVERSAL_CONFIRM_WINDOW_US: u32 = 45_000;
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReversalMemory {
+    x_candidate: i32,
+    y_candidate: i32,
+    x_samples: u8,
+    y_samples: u8,
+    x_flushed: bool,
+    y_flushed: bool,
+    x_direction: i8,
+    y_direction: i8,
+    x_seq: u32,
+    y_seq: u32,
+    x_us: u32,
+    y_us: u32,
+    x_confirmed_seq: u32,
+    y_confirmed_seq: u32,
+    x_confirmed_us: u32,
+    y_confirmed_us: u32,
+    x_first_seq: u32,
+    y_first_seq: u32,
+    x_first_us: u32,
+    y_first_us: u32,
+    device_id: u8,
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+fn meaningful_source_sign(value: i32) -> i8 {
+    if value.unsigned_abs() < REVERSAL_SOURCE_DEADBAND {
+        0
+    } else if value < 0 {
+        -1
+    } else {
+        1
+    }
+}
+
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+static BLE_MOUSE_RETRY: Signal<crate::RawMutex, MouseRetry> = Signal::new();
+
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseChunkPlan {
+    report: MouseReport,
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    emitted_x: i16,
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    emitted_y: i16,
+    diag: MouseChunkDiag,
+    remaining_x: i32,
+    remaining_y: i32,
+    remaining_wheel: i32,
+    remaining_pan: i32,
+    remaining_oldest_enqueued_at: Instant,
+    stale_compress: bool,
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    remaining_stale_vectors: u8,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    commit_reversal_x: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    commit_reversal_y: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_write_x: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_write_y: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_unconfirmed_x: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_unconfirmed_y: bool,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_source_seq_x: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_source_seq_y: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_source_us_x: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_source_us_y: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_first_seq_x: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_first_seq_y: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_first_us_x: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_first_us_y: u32,
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    reversal_device_id: u8,
+    dropped_x: u32,
+    dropped_y: u32,
+    age_us: u32,
+}
+
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseRetry {
+    mouse: AccumulatedMouseReport,
+    plan: MouseChunkPlan,
 }
 
 impl AccumulatedMouseReport {
@@ -2482,6 +3163,59 @@ impl AccumulatedMouseReport {
             oldest_enqueued_at: enqueued_at,
             source_reports: 1,
             preserve_vector: cfg!(feature = "mouse_vector_preserve"),
+            #[cfg(feature = "rtt_diag")]
+            source: None,
+            #[cfg(any(
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            stale_vectors_remaining: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_device_id: 0,
         }
     }
 
@@ -2498,6 +3232,59 @@ impl AccumulatedMouseReport {
             // before enqueueing. Preserve that behavior after moving the
             // chunking into the transport writer.
             preserve_vector: true,
+            #[cfg(feature = "rtt_diag")]
+            source: report.source,
+            #[cfg(any(
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            stale_vectors_remaining: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_device_id: 0,
         }
     }
 
@@ -2513,10 +3300,343 @@ impl AccumulatedMouseReport {
         }
     }
 
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    fn reversal_memory(&self) -> ReversalMemory {
+        ReversalMemory {
+            x_candidate: self.reversal_x_candidate,
+            y_candidate: self.reversal_y_candidate,
+            x_samples: self.reversal_x_samples,
+            y_samples: self.reversal_y_samples,
+            x_flushed: self.reversal_x_candidate_flushed,
+            y_flushed: self.reversal_y_candidate_flushed,
+            x_direction: self.reversal_x_direction,
+            y_direction: self.reversal_y_direction,
+            x_seq: self.reversal_x_source_seq,
+            y_seq: self.reversal_y_source_seq,
+            x_us: self.reversal_x_source_us,
+            y_us: self.reversal_y_source_us,
+            x_confirmed_seq: self.reversal_x_confirmed_seq,
+            y_confirmed_seq: self.reversal_y_confirmed_seq,
+            x_confirmed_us: self.reversal_x_confirmed_us,
+            y_confirmed_us: self.reversal_y_confirmed_us,
+            x_first_seq: self.reversal_x_first_seq,
+            y_first_seq: self.reversal_y_first_seq,
+            x_first_us: self.reversal_x_first_us,
+            y_first_us: self.reversal_y_first_us,
+            device_id: self.reversal_device_id,
+        }
+    }
+
+    /// Restore committed per-source history before feeding the first report
+    /// of a new aggregate.  Only immutable raw source metadata is detector
+    /// evidence; transformed movement is kept separately for HID output.
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    fn restore_reversal_memory_and_process_first(
+        &mut self,
+        memory: ReversalMemory,
+        #[cfg(feature = "rtt_diag")] source: Option<crate::rtt_diag::MouseSourceMeta>,
+    ) {
+        #[cfg(feature = "rtt_diag")]
+        let source_device = source.map(|meta| meta.device_id).unwrap_or(memory.device_id);
+        #[cfg(not(feature = "rtt_diag"))]
+        let source_device = memory.device_id;
+        #[cfg(feature = "rtt_diag")]
+        let (current_source_seq, current_source_us, raw_x, raw_y) = source
+            .map(|meta| (meta.seq, meta.timestamp_us, Some(meta.raw_x), Some(meta.raw_y)))
+            .unwrap_or((0, 0, None, None));
+        #[cfg(not(feature = "rtt_diag"))]
+        let (current_source_seq, current_source_us, raw_x, raw_y) = (0, 0, None, None);
+        let memory = if memory.device_id == 0 || memory.device_id == source_device {
+            memory
+        } else {
+            ReversalMemory {
+                device_id: source_device,
+                ..ReversalMemory::default()
+            }
+        };
+        let first_x = core::mem::take(&mut self.x);
+        let first_y = core::mem::take(&mut self.y);
+        self.reversal_x_candidate = memory.x_candidate;
+        self.reversal_y_candidate = memory.y_candidate;
+        self.reversal_x_samples = memory.x_samples;
+        self.reversal_y_samples = memory.y_samples;
+        self.reversal_x_candidate_flushed = memory.x_flushed;
+        self.reversal_y_candidate_flushed = memory.y_flushed;
+        self.reversal_x_direction = memory.x_direction;
+        self.reversal_y_direction = memory.y_direction;
+        self.reversal_x_source_seq = memory.x_seq;
+        self.reversal_y_source_seq = memory.y_seq;
+        self.reversal_x_source_us = memory.x_us;
+        self.reversal_y_source_us = memory.y_us;
+        self.reversal_x_confirmed_seq = memory.x_confirmed_seq;
+        self.reversal_y_confirmed_seq = memory.y_confirmed_seq;
+        self.reversal_x_confirmed_us = memory.x_confirmed_us;
+        self.reversal_y_confirmed_us = memory.y_confirmed_us;
+        self.reversal_x_first_seq = memory.x_first_seq;
+        self.reversal_y_first_seq = memory.y_first_seq;
+        self.reversal_x_first_us = memory.x_first_us;
+        self.reversal_y_first_us = memory.y_first_us;
+        self.reversal_device_id = source_device;
+        Self::merge_reversal_axis(
+            &mut self.x,
+            &mut self.reversal_x_candidate,
+            &mut self.reversal_x_samples,
+            &mut self.reversal_x_candidate_flushed,
+            &mut self.reversal_x_write_pending,
+            &mut self.reversal_x_direction,
+            &mut self.reversal_x_source_seq,
+            &mut self.reversal_x_source_us,
+            &mut self.reversal_x_confirmed_seq,
+            &mut self.reversal_x_confirmed_us,
+            &mut self.reversal_x_first_seq,
+            &mut self.reversal_x_first_us,
+            first_x,
+            raw_x,
+            b'x',
+            source_device,
+            current_source_seq,
+            current_source_us,
+        );
+        Self::merge_reversal_axis(
+            &mut self.y,
+            &mut self.reversal_y_candidate,
+            &mut self.reversal_y_samples,
+            &mut self.reversal_y_candidate_flushed,
+            &mut self.reversal_y_write_pending,
+            &mut self.reversal_y_direction,
+            &mut self.reversal_y_source_seq,
+            &mut self.reversal_y_source_us,
+            &mut self.reversal_y_confirmed_seq,
+            &mut self.reversal_y_confirmed_us,
+            &mut self.reversal_y_first_seq,
+            &mut self.reversal_y_first_us,
+            first_y,
+            raw_y,
+            b'y',
+            source_device,
+            current_source_seq,
+            current_source_us,
+        );
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[allow(clippy::too_many_arguments)]
+    fn merge_reversal_axis(
+        residual: &mut i32,
+        candidate: &mut i32,
+        samples: &mut u8,
+        candidate_flushed: &mut bool,
+        write_pending: &mut bool,
+        source_direction: &mut i8,
+        source_seq: &mut u32,
+        source_us: &mut u32,
+        confirmed_seq: &mut u32,
+        confirmed_us: &mut u32,
+        first_seq: &mut u32,
+        first_us: &mut u32,
+        motion_input: i32,
+        raw_input: Option<i32>,
+        axis: u8,
+        device: u8,
+        current_source_seq: u32,
+        current_source_us: u32,
+    ) {
+        #[cfg(not(feature = "rtt_diag"))]
+        let _ = (axis, device);
+        let Some(raw_input) = raw_input else {
+            *residual = residual.saturating_add(motion_input);
+            return;
+        };
+        if *source_seq != 0 && current_source_seq == *source_seq {
+            // A duplicate never advances evidence.  Preserve the historical
+            // B2 movement semantics rather than silently dropping its bytes.
+            *residual = residual.saturating_add(motion_input);
+            return;
+        }
+
+        let input_direction = meaningful_source_sign(raw_input);
+        if input_direction == 0 {
+            // Sub-deadband raw reports are movement only.  Neither their
+            // transformed values nor an aggregate total can seed history.
+            // They still advance the observed source sequence so an ordinary
+            // quiet report between meaningful samples is not a transport gap.
+            *residual = residual.saturating_add(motion_input);
+            *source_seq = current_source_seq;
+            return;
+        }
+
+        let idle = *source_us != 0
+            && current_source_us != 0
+            && current_source_us.wrapping_sub(*source_us) >= REVERSAL_GESTURE_IDLE_US;
+        if idle {
+            if *candidate != 0 && !*candidate_flushed {
+                *residual = residual.saturating_add(*candidate);
+            }
+            *candidate = 0;
+            *samples = 0;
+            *candidate_flushed = false;
+            *write_pending = false;
+            *confirmed_seq = 0;
+            *confirmed_us = 0;
+            *first_seq = 0;
+            *first_us = 0;
+            *source_direction = input_direction;
+            *confirmed_seq = 0;
+            *confirmed_us = 0;
+            *source_seq = current_source_seq;
+            *source_us = current_source_us;
+            *residual = residual.saturating_add(motion_input);
+            #[cfg(feature = "rtt_diag")]
+            crate::rtt_diag::record_mouse_reversal_epoch(axis, device, current_source_seq, current_source_us);
+            return;
+        }
+
+        if *write_pending {
+            if input_direction != *source_direction {
+                *candidate = candidate.saturating_add(motion_input);
+            } else {
+                *residual = residual.saturating_add(motion_input);
+            }
+            *source_seq = current_source_seq;
+            *source_us = current_source_us;
+            return;
+        }
+
+        if *source_direction == 0 {
+            // First meaningful report of an epoch is baseline only.
+            *source_direction = input_direction;
+            *confirmed_seq = 0;
+            *confirmed_us = 0;
+            *source_seq = current_source_seq;
+            *source_us = current_source_us;
+            *residual = residual.saturating_add(motion_input);
+            return;
+        }
+
+        if *candidate != 0 {
+            if input_direction != *source_direction {
+                let expected_seq = if *source_seq == u32::MAX {
+                    1
+                } else {
+                    source_seq.wrapping_add(1)
+                };
+                let contiguous = *source_seq == 0 || current_source_seq == 0 || current_source_seq == expected_seq;
+                let timely = *source_us == 0
+                    || current_source_us == 0
+                    || current_source_us.wrapping_sub(*source_us) <= REVERSAL_CONFIRM_WINDOW_US;
+                if !contiguous || !timely {
+                    #[cfg(feature = "rtt_diag")]
+                    crate::rtt_diag::record_mouse_reversal_cancel(
+                        axis,
+                        device,
+                        *first_seq,
+                        *first_us,
+                        current_source_seq,
+                        current_source_us,
+                    );
+                    if !*candidate_flushed {
+                        *residual = residual.saturating_add(*candidate);
+                    }
+                    *candidate = motion_input;
+                    *samples = 1;
+                    *candidate_flushed = false;
+                    *confirmed_seq = 0;
+                    *confirmed_us = 0;
+                    *first_seq = current_source_seq;
+                    *first_us = current_source_us;
+                    *source_seq = current_source_seq;
+                    *source_us = current_source_us;
+                    #[cfg(feature = "rtt_diag")]
+                    crate::rtt_diag::record_mouse_reversal_candidate(
+                        axis, device, *residual, raw_input, *first_seq, *first_us,
+                    );
+                    return;
+                }
+                *candidate = if *candidate_flushed {
+                    motion_input
+                } else {
+                    candidate.saturating_add(motion_input)
+                };
+                *samples = samples.saturating_add(1);
+                *candidate_flushed = false;
+                *source_seq = current_source_seq;
+                *source_us = current_source_us;
+                if *samples >= 2 {
+                    *write_pending = true;
+                    *confirmed_seq = current_source_seq;
+                    *confirmed_us = current_source_us;
+                    #[cfg(feature = "rtt_diag")]
+                    crate::rtt_diag::record_mouse_reversal_confirm(
+                        axis,
+                        device,
+                        *candidate,
+                        *samples,
+                        *first_seq,
+                        *first_us,
+                        current_source_seq,
+                        current_source_us,
+                    );
+                }
+            } else {
+                if !*candidate_flushed {
+                    *residual = residual.saturating_add(*candidate);
+                }
+                *residual = residual.saturating_add(motion_input);
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_mouse_reversal_cancel(
+                    axis,
+                    device,
+                    *first_seq,
+                    *first_us,
+                    current_source_seq,
+                    current_source_us,
+                );
+                *candidate = 0;
+                *samples = 0;
+                *candidate_flushed = false;
+                *confirmed_seq = 0;
+                *confirmed_us = 0;
+                *first_seq = 0;
+                *first_us = 0;
+                *source_seq = current_source_seq;
+                *source_us = current_source_us;
+            }
+            return;
+        }
+
+        if input_direction != *source_direction {
+            *candidate = motion_input;
+            *samples = 1;
+            *candidate_flushed = false;
+            *confirmed_seq = 0;
+            *confirmed_us = 0;
+            *first_seq = current_source_seq;
+            *first_us = current_source_us;
+            *source_seq = current_source_seq;
+            *source_us = current_source_us;
+            #[cfg(feature = "rtt_diag")]
+            crate::rtt_diag::record_mouse_reversal_candidate(axis, device, *residual, raw_input, *first_seq, *first_us);
+        } else {
+            *residual = residual.saturating_add(motion_input);
+            *source_seq = current_source_seq;
+            *source_us = current_source_us;
+        }
+    }
+
     fn merge(&mut self, report: MouseReport, enqueued_at: Instant) {
         debug_assert!(self.can_merge(&report));
-        self.x = self.x.saturating_add(i32::from(report.x));
-        self.y = self.y.saturating_add(i32::from(report.y));
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        {
+            self.x = self.x.saturating_add(i32::from(report.x));
+            self.y = self.y.saturating_add(i32::from(report.y));
+        }
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        {
+            // Generic HID reports have no immutable optical source identity.
+            // They remain lossless movement but are never detector evidence.
+            self.x = self.x.saturating_add(i32::from(report.x));
+            self.y = self.y.saturating_add(i32::from(report.y));
+        }
         self.wheel = self.wheel.saturating_add(i32::from(report.wheel));
         self.pan = self.pan.saturating_add(i32::from(report.pan));
         self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
@@ -2525,8 +3645,75 @@ impl AccumulatedMouseReport {
 
     fn merge_wide(&mut self, report: WideMouseReport, enqueued_at: Instant) {
         debug_assert_eq!(self.buttons, report.buttons);
-        self.x = self.x.saturating_add(report.x);
-        self.y = self.y.saturating_add(report.y);
+        #[cfg(feature = "rtt_diag")]
+        let source = report.source;
+        #[cfg(feature = "rtt_diag")]
+        if source.is_some() {
+            self.source = source;
+        }
+        #[cfg(all(feature = "rtt_diag", feature = "mouse_realtime_reversal_budget_3"))]
+        let (current_source_seq, current_source_us, raw_x, raw_y, source_device) = source
+            .map(|meta| {
+                (
+                    meta.seq,
+                    meta.timestamp_us,
+                    Some(meta.raw_x),
+                    Some(meta.raw_y),
+                    meta.device_id,
+                )
+            })
+            .unwrap_or((0, 0, None, None, self.reversal_device_id));
+        #[cfg(all(not(feature = "rtt_diag"), feature = "mouse_realtime_reversal_budget_3"))]
+        let (current_source_seq, current_source_us, raw_x, raw_y, source_device) =
+            (0, 0, None, None, self.reversal_device_id);
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        {
+            self.x = self.x.saturating_add(report.x);
+            self.y = self.y.saturating_add(report.y);
+        }
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        {
+            Self::merge_reversal_axis(
+                &mut self.x,
+                &mut self.reversal_x_candidate,
+                &mut self.reversal_x_samples,
+                &mut self.reversal_x_candidate_flushed,
+                &mut self.reversal_x_write_pending,
+                &mut self.reversal_x_direction,
+                &mut self.reversal_x_source_seq,
+                &mut self.reversal_x_source_us,
+                &mut self.reversal_x_confirmed_seq,
+                &mut self.reversal_x_confirmed_us,
+                &mut self.reversal_x_first_seq,
+                &mut self.reversal_x_first_us,
+                report.x,
+                raw_x,
+                b'x',
+                source_device,
+                current_source_seq,
+                current_source_us,
+            );
+            Self::merge_reversal_axis(
+                &mut self.y,
+                &mut self.reversal_y_candidate,
+                &mut self.reversal_y_samples,
+                &mut self.reversal_y_candidate_flushed,
+                &mut self.reversal_y_write_pending,
+                &mut self.reversal_y_direction,
+                &mut self.reversal_y_source_seq,
+                &mut self.reversal_y_source_us,
+                &mut self.reversal_y_confirmed_seq,
+                &mut self.reversal_y_confirmed_us,
+                &mut self.reversal_y_first_seq,
+                &mut self.reversal_y_first_us,
+                report.y,
+                raw_y,
+                b'y',
+                source_device,
+                current_source_seq,
+                current_source_us,
+            );
+        }
         self.wheel = self.wheel.saturating_add(report.wheel);
         self.pan = self.pan.saturating_add(report.pan);
         self.oldest_enqueued_at = self.oldest_enqueued_at.min(enqueued_at);
@@ -2546,9 +3733,568 @@ impl AccumulatedMouseReport {
         let diag = MouseWriteDiag {
             oldest_enqueued_at: self.oldest_enqueued_at,
             source_reports: self.source_reports,
+            input_x: 0,
+            input_y: 0,
+            residual_x: 0,
+            residual_y: 0,
+            #[cfg(feature = "rtt_diag")]
+            source: self.source,
         };
         self.source_reports = 0;
         diag
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    fn write_diag(&self) -> MouseWriteDiag {
+        MouseWriteDiag {
+            oldest_enqueued_at: self.oldest_enqueued_at,
+            source_reports: self.source_reports,
+            input_x: 0,
+            input_y: 0,
+            residual_x: 0,
+            residual_y: 0,
+            #[cfg(feature = "rtt_diag")]
+            source: self.source,
+        }
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    fn prepare_chunk(&self, now: Instant) -> MouseChunkPlan {
+        // Reuse the proven B6 reversal decision/identity metadata, then widen
+        // only the BLE transport chunk. The legacy plan's diag.input fields
+        // are the effective post-acceleration values selected for this write
+        // before i8 retirement.
+        let mut plan = self.prepare_chunk_8(now);
+        plan.emitted_x = plan.diag.input_x.clamp(-32_767, 32_767) as i16;
+        plan.emitted_y = plan.diag.input_y.clamp(-32_767, 32_767) as i16;
+        plan.remaining_x = plan.diag.input_x - i32::from(plan.emitted_x);
+        plan.remaining_y = plan.diag.input_y - i32::from(plan.emitted_y);
+        plan.diag.residual_x = plan.remaining_x;
+        plan.diag.residual_y = plan.remaining_y;
+        plan.remaining_oldest_enqueued_at = if plan.remaining_x == 0 && plan.remaining_y == 0 {
+            now
+        } else {
+            self.oldest_enqueued_at
+        };
+        plan.stale_compress = false;
+        plan.remaining_stale_vectors = 0;
+        plan.dropped_x = 0;
+        plan.dropped_y = 0;
+        plan
+    }
+
+    #[cfg(all(
+        not(feature = "mouse_ble_16bit_report"),
+        any(
+            feature = "mouse_realtime_age_cap_30ms",
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        )
+    ))]
+    fn prepare_chunk(&self, now: Instant) -> MouseChunkPlan {
+        self.prepare_chunk_8(now)
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    fn prepare_chunk_8(&self, now: Instant) -> MouseChunkPlan {
+        const AGE_CAP_US: u32 = 30_000;
+
+        fn proportional_xy(x: i32, y: i32, max_component: u32) -> (i32, i32) {
+            let max_abs = x.unsigned_abs().max(y.unsigned_abs());
+            debug_assert!(max_abs > 0);
+            let scale = |value: i32| -> i32 {
+                if value == 0 {
+                    return 0;
+                }
+                let rounded = (u64::from(value.unsigned_abs()) * u64::from(max_component) + u64::from(max_abs) / 2)
+                    / u64::from(max_abs);
+                let magnitude = rounded.clamp(1, u64::from(max_component)) as i32;
+                if value < 0 { -magnitude } else { magnitude }
+            };
+            (scale(x), scale(y))
+        }
+
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let unconfirmed_flush_x = self.x == 0
+            && self.reversal_x_candidate != 0
+            && !self.reversal_x_write_pending
+            && !self.reversal_x_candidate_flushed;
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let unconfirmed_flush_y = self.y == 0
+            && self.reversal_y_candidate != 0
+            && !self.reversal_y_write_pending
+            && !self.reversal_y_candidate_flushed;
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let commit_reversal_x = self.reversal_x_write_pending;
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let commit_reversal_y = self.reversal_y_write_pending;
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        let commit_reversal_x = false;
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        let commit_reversal_y = false;
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let effective_x = if commit_reversal_x || unconfirmed_flush_x {
+            self.reversal_x_candidate
+        } else {
+            self.x
+        };
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        let effective_x = self.x;
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let effective_y = if commit_reversal_y || unconfirmed_flush_y {
+            self.reversal_y_candidate
+        } else {
+            self.y
+        };
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        let effective_y = self.y;
+
+        let age_us = now
+            .duration_since(self.oldest_enqueued_at)
+            .as_micros()
+            .min(u64::from(u32::MAX)) as u32;
+        let oversized_xy = effective_x < i32::from(i8::MIN)
+            || effective_x > i32::from(i8::MAX)
+            || effective_y < i32::from(i8::MIN)
+            || effective_y > i32::from(i8::MAX);
+
+        #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+        if age_us > AGE_CAP_US && oversized_xy {
+            let (x, y) = proportional_xy(effective_x, effective_y, 127);
+            let x = x as i8;
+            let y = y as i8;
+            let wheel = self.wheel.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            let pan = self.pan.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            return MouseChunkPlan {
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_x: 0,
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_y: 0,
+                report: MouseReport {
+                    buttons: self.buttons,
+                    x,
+                    y,
+                    wheel,
+                    pan,
+                },
+                diag: MouseChunkDiag {
+                    input_x: effective_x,
+                    input_y: effective_y,
+                    residual_x: 0,
+                    residual_y: 0,
+                },
+                remaining_x: 0,
+                remaining_y: 0,
+                remaining_wheel: self.wheel - i32::from(wheel),
+                remaining_pan: self.pan - i32::from(pan),
+                remaining_oldest_enqueued_at: now,
+                stale_compress: true,
+                dropped_x: effective_x.unsigned_abs().saturating_sub(i32::from(x).unsigned_abs()),
+                dropped_y: effective_y.unsigned_abs().saturating_sub(i32::from(y).unsigned_abs()),
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_x: self.reversal_x_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_y: self.reversal_y_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_x: unconfirmed_flush_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_y: unconfirmed_flush_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_seq
+                } else {
+                    self.reversal_x_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_seq
+                } else {
+                    self.reversal_y_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_us
+                } else {
+                    self.reversal_x_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_us
+                } else {
+                    self.reversal_y_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_x: self.reversal_x_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_y: self.reversal_y_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_x: self.reversal_x_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_y: self.reversal_y_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_device_id: self.reversal_device_id,
+                age_us,
+            };
+        }
+
+        #[cfg(any(
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        if self.stale_vectors_remaining > 0 && effective_x == 0 && effective_y == 0 {
+            let mut remainder = *self;
+            remainder.x = effective_x;
+            remainder.y = effective_y;
+            remainder.stale_vectors_remaining = 0;
+            let (report, diag) = remainder.take_chunk();
+            return MouseChunkPlan {
+                report,
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_x: 0,
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_y: 0,
+                diag,
+                remaining_x: remainder.x,
+                remaining_y: remainder.y,
+                remaining_wheel: remainder.wheel,
+                remaining_pan: remainder.pan,
+                remaining_oldest_enqueued_at: now,
+                stale_compress: true,
+                remaining_stale_vectors: 0,
+                dropped_x: 0,
+                dropped_y: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_x: self.reversal_x_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_y: self.reversal_y_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_x: unconfirmed_flush_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_y: unconfirmed_flush_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_seq
+                } else {
+                    self.reversal_x_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_seq
+                } else {
+                    self.reversal_y_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_us
+                } else {
+                    self.reversal_x_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_us
+                } else {
+                    self.reversal_y_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_x: self.reversal_x_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_y: self.reversal_y_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_x: self.reversal_x_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_y: self.reversal_y_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_device_id: self.reversal_device_id,
+                age_us,
+            };
+        }
+
+        #[cfg(any(
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        if self.stale_vectors_remaining > 0 || (age_us > AGE_CAP_US && oversized_xy) {
+            let budget = if self.stale_vectors_remaining == 0 {
+                3
+            } else {
+                self.stale_vectors_remaining
+            };
+            let retained_cap = u32::from(budget) * 127;
+            let retained_target = effective_x
+                .unsigned_abs()
+                .max(effective_y.unsigned_abs())
+                .min(retained_cap);
+            let (retained_x, retained_y) = proportional_xy(effective_x, effective_y, retained_target);
+            let (x, y) = proportional_xy(
+                retained_x,
+                retained_y,
+                retained_x.unsigned_abs().max(retained_y.unsigned_abs()).min(127),
+            );
+            let x = x as i8;
+            let y = y as i8;
+            let wheel = self.wheel.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            let pan = self.pan.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+            let remaining_stale_vectors = budget - 1;
+            let remaining_x = if remaining_stale_vectors == 0 {
+                0
+            } else {
+                retained_x - i32::from(x)
+            };
+            let remaining_y = if remaining_stale_vectors == 0 {
+                0
+            } else {
+                retained_y - i32::from(y)
+            };
+            return MouseChunkPlan {
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_x: 0,
+                #[cfg(feature = "mouse_ble_16bit_report")]
+                emitted_y: 0,
+                report: MouseReport {
+                    buttons: self.buttons,
+                    x,
+                    y,
+                    wheel,
+                    pan,
+                },
+                diag: MouseChunkDiag {
+                    input_x: effective_x,
+                    input_y: effective_y,
+                    residual_x: remaining_x,
+                    residual_y: remaining_y,
+                },
+                remaining_x,
+                remaining_y,
+                remaining_wheel: self.wheel - i32::from(wheel),
+                remaining_pan: self.pan - i32::from(pan),
+                remaining_oldest_enqueued_at: if remaining_stale_vectors == 0
+                    || cfg!(feature = "mouse_realtime_reversal_budget_3") && (commit_reversal_x || commit_reversal_y)
+                {
+                    now
+                } else {
+                    self.oldest_enqueued_at
+                },
+                stale_compress: true,
+                remaining_stale_vectors,
+                dropped_x: effective_x
+                    .unsigned_abs()
+                    .saturating_sub(i32::from(x).unsigned_abs().saturating_add(remaining_x.unsigned_abs())),
+                dropped_y: effective_y
+                    .unsigned_abs()
+                    .saturating_sub(i32::from(y).unsigned_abs().saturating_add(remaining_y.unsigned_abs())),
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                commit_reversal_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_x: self.reversal_x_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_write_y: self.reversal_y_write_pending,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_x: unconfirmed_flush_x,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_unconfirmed_y: unconfirmed_flush_y,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_seq
+                } else {
+                    self.reversal_x_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_seq_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_seq
+                } else {
+                    self.reversal_y_source_seq
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_x: if self.reversal_x_write_pending {
+                    self.reversal_x_confirmed_us
+                } else {
+                    self.reversal_x_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_source_us_y: if self.reversal_y_write_pending {
+                    self.reversal_y_confirmed_us
+                } else {
+                    self.reversal_y_source_us
+                },
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_x: self.reversal_x_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_seq_y: self.reversal_y_first_seq,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_x: self.reversal_x_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_first_us_y: self.reversal_y_first_us,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_device_id: self.reversal_device_id,
+                age_us,
+            };
+        }
+
+        let mut remainder = *self;
+        remainder.x = effective_x;
+        remainder.y = effective_y;
+        let (report, diag) = remainder.take_chunk();
+        MouseChunkPlan {
+            report,
+            #[cfg(feature = "mouse_ble_16bit_report")]
+            emitted_x: 0,
+            #[cfg(feature = "mouse_ble_16bit_report")]
+            emitted_y: 0,
+            diag,
+            remaining_x: remainder.x,
+            remaining_y: remainder.y,
+            remaining_wheel: remainder.wheel,
+            remaining_pan: remainder.pan,
+            remaining_oldest_enqueued_at: if cfg!(feature = "mouse_realtime_reversal_budget_3")
+                && (commit_reversal_x || commit_reversal_y)
+            {
+                now
+            } else {
+                self.oldest_enqueued_at
+            },
+            stale_compress: false,
+            #[cfg(any(
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            remaining_stale_vectors: 0,
+            dropped_x: 0,
+            dropped_y: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            commit_reversal_x,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            commit_reversal_y,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_write_x: self.reversal_x_write_pending,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_write_y: self.reversal_y_write_pending,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_unconfirmed_x: unconfirmed_flush_x,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_unconfirmed_y: unconfirmed_flush_y,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_source_seq_x: if self.reversal_x_write_pending {
+                self.reversal_x_confirmed_seq
+            } else {
+                self.reversal_x_source_seq
+            },
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_source_seq_y: if self.reversal_y_write_pending {
+                self.reversal_y_confirmed_seq
+            } else {
+                self.reversal_y_source_seq
+            },
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_source_us_x: if self.reversal_x_write_pending {
+                self.reversal_x_confirmed_us
+            } else {
+                self.reversal_x_source_us
+            },
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_source_us_y: if self.reversal_y_write_pending {
+                self.reversal_y_confirmed_us
+            } else {
+                self.reversal_y_source_us
+            },
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_first_seq_x: self.reversal_x_first_seq,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_first_seq_y: self.reversal_y_first_seq,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_first_us_x: self.reversal_x_first_us,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_first_us_y: self.reversal_y_first_us,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_device_id: self.reversal_device_id,
+            age_us,
+        }
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    fn commit_chunk(&mut self, plan: MouseChunkPlan) {
+        self.x = plan.remaining_x;
+        self.y = plan.remaining_y;
+        self.wheel = plan.remaining_wheel;
+        self.pan = plan.remaining_pan;
+        self.oldest_enqueued_at = plan.remaining_oldest_enqueued_at;
+        self.source_reports = 0;
+        #[cfg(any(
+            feature = "mouse_realtime_burst_budget_3",
+            feature = "mouse_realtime_reversal_budget_3"
+        ))]
+        {
+            self.stale_vectors_remaining = plan.remaining_stale_vectors;
+        }
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        {
+            if plan.commit_reversal_x {
+                self.reversal_x_direction = -self.reversal_x_direction;
+                self.reversal_x_candidate = 0;
+                self.reversal_x_samples = 0;
+                self.reversal_x_write_pending = false;
+                self.reversal_x_candidate_flushed = false;
+                self.reversal_x_confirmed_seq = 0;
+                self.reversal_x_confirmed_us = 0;
+                self.reversal_x_first_seq = 0;
+                self.reversal_x_first_us = 0;
+            } else if plan.reversal_unconfirmed_x {
+                self.x = 0;
+                if plan.remaining_x == 0 {
+                    self.reversal_x_candidate = self.reversal_x_candidate.signum();
+                    self.reversal_x_candidate_flushed = true;
+                } else {
+                    self.reversal_x_candidate = plan.remaining_x;
+                    self.reversal_x_candidate_flushed = false;
+                }
+            }
+            if plan.commit_reversal_y {
+                self.reversal_y_direction = -self.reversal_y_direction;
+                self.reversal_y_candidate = 0;
+                self.reversal_y_samples = 0;
+                self.reversal_y_write_pending = false;
+                self.reversal_y_candidate_flushed = false;
+                self.reversal_y_confirmed_seq = 0;
+                self.reversal_y_confirmed_us = 0;
+                self.reversal_y_first_seq = 0;
+                self.reversal_y_first_us = 0;
+            } else if plan.reversal_unconfirmed_y {
+                self.y = 0;
+                if plan.remaining_y == 0 {
+                    self.reversal_y_candidate = self.reversal_y_candidate.signum();
+                    self.reversal_y_candidate_flushed = true;
+                } else {
+                    self.reversal_y_candidate = plan.remaining_y;
+                    self.reversal_y_candidate_flushed = false;
+                }
+            }
+        }
     }
 
     fn take_chunk(&mut self) -> (MouseReport, MouseChunkDiag) {
@@ -2593,7 +4339,12 @@ impl AccumulatedMouseReport {
     }
 
     fn has_relative_motion(&self) -> bool {
-        self.x != 0 || self.y != 0 || self.wheel != 0 || self.pan != 0
+        #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+        let has_reversal_candidate = (self.reversal_x_candidate != 0 && !self.reversal_x_candidate_flushed)
+            || (self.reversal_y_candidate != 0 && !self.reversal_y_candidate_flushed);
+        #[cfg(not(feature = "mouse_realtime_reversal_budget_3"))]
+        let has_reversal_candidate = false;
+        self.x != 0 || self.y != 0 || self.wheel != 0 || self.pan != 0 || has_reversal_candidate
     }
 }
 
@@ -3366,6 +5117,31 @@ mod tests {
         }
     }
 
+    struct FailingBleHidWriter;
+
+    impl crate::hid::HidWriterTrait for FailingBleHidWriter {
+        type ReportType = Report;
+
+        async fn write_report(&mut self, _report: &Self::ReportType) -> Result<usize, crate::hid::HidError> {
+            Err(crate::hid::HidError::BleError)
+        }
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[test]
+    fn realtime_policy_does_not_treat_tolerated_gatt_error_as_success() {
+        let mut writer = FailingBleHidWriter;
+        let report = Report::MouseReport(mouse_report(0, 1, 0, 0, 0));
+        assert_eq!(
+            block_on(super::write_ble_hid_report(&mut writer, &report, false, None)),
+            Err(super::BleKeyboardExit::HidWriteStalled)
+        );
+    }
+
     fn mouse_report(buttons: u8, x: i8, y: i8, wheel: i8, pan: i8) -> MouseReport {
         MouseReport {
             buttons,
@@ -3463,6 +5239,57 @@ mod tests {
                 oldest_enqueued_at: now,
                 source_reports: 1,
                 preserve_vector: true,
+                #[cfg(any(
+                    feature = "mouse_realtime_burst_budget_3",
+                    feature = "mouse_realtime_reversal_budget_3"
+                ))]
+                stale_vectors_remaining: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_candidate: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_candidate: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_samples: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_samples: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_write_pending: false,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_write_pending: false,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_direction: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_direction: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_source_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_source_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_source_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_source_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_confirmed_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_confirmed_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_confirmed_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_confirmed_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_first_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_first_seq: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_first_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_first_us: 0,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_x_candidate_flushed: false,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_y_candidate_flushed: false,
+                #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+                reversal_device_id: 0,
             };
             let mut total_x = 0i32;
             let mut total_y = 0i32;
@@ -3478,6 +5305,883 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    fn aged_mouse(x: i32, y: i32, wheel: i32, pan: i32, buttons: u8) -> super::AccumulatedMouseReport {
+        super::AccumulatedMouseReport {
+            buttons,
+            x,
+            y,
+            wheel,
+            pan,
+            oldest_enqueued_at: Instant::from_millis(0),
+            source_reports: 3,
+            preserve_vector: true,
+            #[cfg(any(
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            stale_vectors_remaining: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_device_id: 0,
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_keeps_at_or_below_30ms_lossless() {
+        let mut accumulated = aged_mouse(300, 90, 0, 0, 0);
+        let mut total = (0i32, 0i32);
+        while accumulated.has_relative_motion() {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(30));
+            assert!(!plan.stale_compress);
+            total.0 += i32::from(plan.report.x);
+            total.1 += i32::from(plan.report.y);
+            accumulated.commit_chunk(plan);
+        }
+        assert_eq!(total, (300, 90));
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_compresses_huge_single_axes() {
+        for (input, expected) in [((10_000, 0), (127, 0)), ((0, -10_000), (0, -127))] {
+            let accumulated = aged_mouse(input.0, input.1, 0, 0, 0);
+            let plan = accumulated.prepare_chunk(Instant::from_millis(31));
+            assert!(plan.stale_compress);
+            assert_eq!((plan.report.x, plan.report.y), expected);
+            assert_eq!((plan.remaining_x, plan.remaining_y), (0, 0));
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_preserves_diagonal_ratio_and_quadrant_signs() {
+        for (x, y, expected_x, expected_y) in [
+            (300, 90, 127, 38),
+            (300, -90, 127, -38),
+            (-300, 90, -127, 38),
+            (-300, -90, -127, -38),
+            (10_000, 1, 127, 1),
+        ] {
+            let plan = aged_mouse(x, y, 0, 0, 0).prepare_chunk(Instant::from_millis(31));
+            assert_eq!((plan.report.x, plan.report.y), (expected_x, expected_y));
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_commits_only_after_success_and_retry_is_identical() {
+        let mut accumulated = aged_mouse(500, -250, 0, 0, 0);
+        let original_oldest = accumulated.oldest_enqueued_at;
+        let first_attempt = accumulated.prepare_chunk(Instant::from_millis(31));
+        let retry = accumulated.prepare_chunk(Instant::from_millis(32));
+        assert_eq!(first_attempt.report, retry.report);
+        assert_eq!((accumulated.x, accumulated.y), (500, -250));
+        assert_eq!(accumulated.oldest_enqueued_at, original_oldest);
+        assert_eq!(accumulated.source_reports, 3);
+
+        accumulated.commit_chunk(retry);
+        assert_eq!((accumulated.x, accumulated.y), (0, 0));
+        assert!(!accumulated.has_relative_motion());
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_rebases_wheel_remainder_before_new_xy() {
+        let mut accumulated = aged_mouse(5_000, -2_500, 300, 0, 0);
+        let stale = accumulated.prepare_chunk(Instant::from_millis(31));
+        assert!(stale.stale_compress);
+        assert_eq!(stale.remaining_wheel, 173);
+
+        accumulated.commit_chunk(stale);
+        assert_eq!(accumulated.oldest_enqueued_at, Instant::from_millis(31));
+        assert_eq!(accumulated.source_reports, 0);
+        accumulated.merge_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: 500,
+                y: -250,
+                wheel: 0,
+                pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            Instant::from_millis(32),
+        );
+        assert_eq!(accumulated.source_reports, 1);
+
+        let fresh = accumulated.prepare_chunk(Instant::from_millis(33));
+        assert!(!fresh.stale_compress);
+        assert_ne!((fresh.remaining_x, fresh.remaining_y), (0, 0));
+        assert_eq!(i32::from(fresh.report.x) + fresh.remaining_x, 500);
+        assert_eq!(i32::from(fresh.report.y) + fresh.remaining_y, -250);
+
+        let mut total_x = i32::from(fresh.report.x);
+        let mut total_y = i32::from(fresh.report.y);
+        accumulated.commit_chunk(fresh);
+        while accumulated.x != 0 || accumulated.y != 0 {
+            let next = accumulated.prepare_chunk(Instant::from_millis(34));
+            assert!(!next.stale_compress);
+            total_x += i32::from(next.report.x);
+            total_y += i32::from(next.report.y);
+            accumulated.commit_chunk(next);
+        }
+        assert_eq!((total_x, total_y), (500, -250));
+    }
+
+    #[cfg(feature = "mouse_realtime_age_cap_30ms")]
+    #[test]
+    fn realtime_age_cap_preserves_buttons_wheel_and_pan() {
+        let mut accumulated = aged_mouse(5_000, 2_500, 300, -300, 5);
+        let first = accumulated.prepare_chunk(Instant::from_millis(31));
+        assert_eq!(first.report.buttons, 5);
+        assert_eq!((first.report.wheel, first.report.pan), (127, -128));
+        accumulated.commit_chunk(first);
+        assert_eq!((accumulated.wheel, accumulated.pan), (173, -172));
+        assert!(accumulated.has_relative_motion());
+
+        accumulated.merge(mouse_report(5, 10, -20, 0, 0), Instant::from_millis(32));
+        assert_eq!((accumulated.x, accumulated.y), (10, -20));
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[cfg(not(feature = "mouse_ble_16bit_report"))]
+    #[test]
+    fn realtime_b2_preserves_quadrant_ratio_and_three_vector_distance_budget() {
+        for (x, y, expected) in [
+            (10_000, 5_000, (381, 191)),
+            (10_000, -5_000, (381, -191)),
+            (-10_000, 5_000, (-381, 191)),
+            (-10_000, -5_000, (-381, -191)),
+        ] {
+            let mut accumulated = aged_mouse(x, y, 0, 0, 0);
+            let mut total = (0, 0);
+            let mut writes = 0;
+            while accumulated.has_relative_motion() {
+                let plan = accumulated.prepare_chunk(Instant::from_millis(31 + writes * 15));
+                assert!(plan.stale_compress);
+                total.0 += i32::from(plan.report.x);
+                total.1 += i32::from(plan.report.y);
+                writes += 1;
+                accumulated.commit_chunk(plan);
+            }
+            assert_eq!(writes, 3);
+            assert_eq!(total, expected);
+            assert!(total.0.unsigned_abs().max(total.1.unsigned_abs()) > 127);
+        }
+    }
+
+    #[cfg(feature = "mouse_bounded_multi_notification_3")]
+    #[test]
+    fn realtime_b7_drains_exactly_one_frozen_stale_epoch_in_three_handoffs() {
+        let mut accumulated = aged_mouse(10_000, 5_000, 0, 0, 0);
+        let mut total = (0i32, 0i32);
+        let mut index = 0u8;
+        loop {
+            index += 1;
+            let plan = accumulated.prepare_chunk(Instant::from_millis(31));
+            total.0 += i32::from(plan.report.x);
+            total.1 += i32::from(plan.report.y);
+            accumulated.commit_chunk(plan);
+            if !super::continue_bounded_stale_burst(index, accumulated.stale_vectors_remaining) {
+                break;
+            }
+        }
+        assert_eq!(index, 3);
+        assert_eq!(total, (381, 191));
+        assert_eq!(accumulated.stale_vectors_remaining, 0);
+        assert!(!accumulated.has_relative_motion());
+    }
+
+    #[cfg(feature = "mouse_bounded_multi_notification_3")]
+    #[test]
+    fn realtime_b7_never_bursts_fresh_residual_and_budget_is_hard_bounded() {
+        assert!(!super::continue_bounded_stale_burst(1, 0));
+        assert!(super::continue_bounded_stale_burst(1, 2));
+        assert!(super::continue_bounded_stale_burst(2, 1));
+        assert!(!super::continue_bounded_stale_burst(3, 1));
+    }
+
+    #[cfg(feature = "mouse_bounded_multi_notification_3")]
+    #[test]
+    fn realtime_b7_failed_second_handoff_is_byte_and_state_identical() {
+        let mut accumulated = aged_mouse(5_000, -2_500, 300, -300, 5);
+        let first = accumulated.prepare_chunk(Instant::from_millis(31));
+        accumulated.commit_chunk(first);
+        let after_first = accumulated;
+        let failed_second = accumulated.prepare_chunk(Instant::from_millis(31));
+        let frozen_retry = super::MouseRetry {
+            mouse: accumulated,
+            plan: failed_second,
+        };
+        assert_eq!(frozen_retry.mouse, after_first);
+        assert_eq!(frozen_retry.plan.report, failed_second.report);
+        assert_eq!(frozen_retry.plan.report.buttons, 5);
+        accumulated.commit_chunk(frozen_retry.plan);
+        assert_eq!(accumulated.stale_vectors_remaining, 1);
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[cfg(not(feature = "mouse_ble_16bit_report"))]
+    #[test]
+    fn realtime_b2_hard_bounds_stale_epoch_to_three_successful_writes() {
+        let mut accumulated = aged_mouse(100_000, -80_000, 0, 0, 0);
+        for write in 0..3 {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(31 + write * 15));
+            assert_eq!(plan.remaining_stale_vectors, 2 - write as u8);
+            accumulated.commit_chunk(plan);
+        }
+        assert!(!accumulated.has_relative_motion());
+        assert_eq!(accumulated.stale_vectors_remaining, 0);
+        assert_eq!(accumulated.oldest_enqueued_at, Instant::from_millis(61));
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[cfg(not(feature = "mouse_ble_16bit_report"))]
+    #[test]
+    fn realtime_b2_error_retry_is_identical_and_mutates_only_after_success() {
+        let mut accumulated = aged_mouse(5_000, -2_500, 300, -300, 5);
+        let original = accumulated;
+        let first = accumulated.prepare_chunk(Instant::from_millis(31));
+        let retry = accumulated.prepare_chunk(Instant::from_millis(47));
+        assert_eq!(first.report, retry.report);
+        assert_eq!(first.remaining_x, retry.remaining_x);
+        assert_eq!(first.remaining_y, retry.remaining_y);
+        assert_eq!(accumulated, original);
+        accumulated.commit_chunk(retry);
+        assert_eq!(accumulated.stale_vectors_remaining, 2);
+        assert_eq!(accumulated.source_reports, 0);
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[test]
+    fn realtime_b2_keeps_wheel_pan_buttons_lossless_across_stale_epoch() {
+        let mut accumulated = aged_mouse(5_000, 2_500, 300, -300, 5);
+        let mut wheel = 0;
+        let mut pan = 0;
+        while accumulated.has_relative_motion() {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(31));
+            assert_eq!(plan.report.buttons, 5);
+            wheel += i32::from(plan.report.wheel);
+            pan += i32::from(plan.report.pan);
+            accumulated.commit_chunk(plan);
+        }
+        assert_eq!((wheel, pan), (300, -300));
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[cfg(not(feature = "mouse_ble_16bit_report"))]
+    #[test]
+    fn realtime_b2_new_motion_does_not_extend_active_stale_budget() {
+        let mut accumulated = aged_mouse(5_000, 2_500, 0, 0, 0);
+        let first = accumulated.prepare_chunk(Instant::from_millis(31));
+        accumulated.commit_chunk(first);
+        accumulated.merge_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: 9_000,
+                y: -4_500,
+                wheel: 0,
+                pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            Instant::from_millis(40),
+        );
+        assert_eq!(accumulated.stale_vectors_remaining, 2);
+        for now in [46, 61] {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(now));
+            accumulated.commit_chunk(plan);
+        }
+        assert_eq!(accumulated.stale_vectors_remaining, 0);
+        assert_eq!((accumulated.x, accumulated.y), (0, 0));
+        assert_eq!(accumulated.oldest_enqueued_at, Instant::from_millis(61));
+    }
+
+    #[cfg(feature = "mouse_realtime_burst_budget_3")]
+    #[test]
+    fn realtime_b2_never_amplifies_residual_after_direction_cancellation() {
+        let mut accumulated = aged_mouse(5_000, 2_500, 0, 0, 0);
+        let first = accumulated.prepare_chunk(Instant::from_millis(31));
+        accumulated.commit_chunk(first);
+        accumulated.merge_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: -200,
+                y: -100,
+                wheel: 0,
+                pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            Instant::from_millis(40),
+        );
+        let before = (accumulated.x, accumulated.y);
+        assert!(before.0.unsigned_abs().max(before.1.unsigned_abs()) < 127);
+        let plan = accumulated.prepare_chunk(Instant::from_millis(46));
+        assert_eq!((i32::from(plan.report.x), i32::from(plan.report.y)), before);
+        assert_eq!((plan.remaining_x, plan.remaining_y), (0, 0));
+    }
+
+    #[cfg(any(
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    #[test]
+    fn realtime_b2_rebases_timestamp_before_fresh_movement() {
+        let mut accumulated = aged_mouse(5_000, -2_500, 300, 0, 0);
+        for now in [31, 46, 61] {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(now));
+            accumulated.commit_chunk(plan);
+        }
+        assert_eq!(accumulated.oldest_enqueued_at, Instant::from_millis(61));
+        accumulated.merge_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: 500,
+                y: -250,
+                wheel: 0,
+                pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            Instant::from_millis(62),
+        );
+        let fresh = accumulated.prepare_chunk(Instant::from_millis(63));
+        assert!(!fresh.stale_compress);
+        assert_eq!(fresh.age_us, 2_000);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[derive(Default)]
+    struct DetectorAxis {
+        residual: i32,
+        candidate: i32,
+        samples: u8,
+        flushed: bool,
+        write_pending: bool,
+        direction: i8,
+        seq: u32,
+        source_us: u32,
+        confirmed_seq: u32,
+        confirmed_us: u32,
+        first_seq: u32,
+        first_us: u32,
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    impl DetectorAxis {
+        fn feed(&mut self, input: i32, seq: u32, source_us: u32) {
+            self.feed_motion(input, input, seq, source_us);
+        }
+
+        fn feed_motion(&mut self, raw_input: i32, motion_input: i32, seq: u32, source_us: u32) {
+            super::AccumulatedMouseReport::merge_reversal_axis(
+                &mut self.residual,
+                &mut self.candidate,
+                &mut self.samples,
+                &mut self.flushed,
+                &mut self.write_pending,
+                &mut self.direction,
+                &mut self.seq,
+                &mut self.source_us,
+                &mut self.confirmed_seq,
+                &mut self.confirmed_us,
+                &mut self.first_seq,
+                &mut self.first_us,
+                motion_input,
+                Some(raw_input),
+                b'x',
+                0,
+                seq,
+                source_us,
+            );
+        }
+
+        fn commit_confirmed(&mut self) {
+            assert!(self.write_pending);
+            self.direction = -self.direction;
+            self.candidate = 0;
+            self.samples = 0;
+            self.flushed = false;
+            self.write_pending = false;
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b6_idle_starts_new_epoch_with_baseline_only() {
+        let mut axis = DetectorAxis::default();
+        axis.feed(120, 1, 1_000);
+        axis.feed(-130, 2, 1_001_000);
+        assert_eq!(axis.direction, -1);
+        assert_eq!(axis.candidate, 0);
+        assert!(!axis.write_pending);
+        axis.feed(-140, 3, 1_016_000);
+        assert!(!axis.write_pending);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b6_acceleration_does_not_change_detector_decision() {
+        let mut off = DetectorAxis::default();
+        let mut on = DetectorAxis::default();
+        off.feed_motion(110, 110, 1, 1_000);
+        on.feed_motion(110, 220, 1, 1_000);
+        off.feed_motion(-105, -105, 2, 16_000);
+        on.feed_motion(-105, -210, 2, 16_000);
+        off.feed_motion(10, 10, 3, 20_000);
+        on.feed_motion(10, 10, 3, 20_000);
+        off.feed_motion(-122, -122, 4, 31_000);
+        on.feed_motion(-122, -244, 4, 31_000);
+        assert!(off.write_pending && on.write_pending);
+        assert_eq!(off.samples, on.samples);
+        assert_eq!(off.first_seq, on.first_seq);
+        assert_eq!(off.seq, on.seq);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b7_hid_plan_freezes_confirmed_second_identity_until_success() {
+        let mut axis = DetectorAxis::default();
+        axis.feed(120, 9, 1_000);
+        axis.feed(-110, 10, 16_000);
+        axis.feed(-125, 11, 31_000);
+        assert!(axis.write_pending);
+        assert_eq!((axis.first_seq, axis.confirmed_seq), (10, 11));
+
+        // A later report belongs to the same physical direction and may
+        // advance detector history, but must not replace confirmation identity.
+        axis.feed(-127, 12, 46_000);
+        assert_eq!(axis.seq, 12);
+        assert_eq!((axis.first_seq, axis.confirmed_seq), (10, 11));
+        assert_eq!((axis.first_us, axis.confirmed_us), (16_000, 31_000));
+
+        let mut accumulated = aged_mouse(0, 0, 0, 0, 0);
+        accumulated.reversal_x_candidate = axis.candidate;
+        accumulated.reversal_x_samples = axis.samples;
+        accumulated.reversal_x_write_pending = axis.write_pending;
+        accumulated.reversal_x_direction = axis.direction;
+        accumulated.reversal_x_source_seq = axis.seq;
+        accumulated.reversal_x_source_us = axis.source_us;
+        accumulated.reversal_x_confirmed_seq = axis.confirmed_seq;
+        accumulated.reversal_x_confirmed_us = axis.confirmed_us;
+        accumulated.reversal_x_first_seq = axis.first_seq;
+        accumulated.reversal_x_first_us = axis.first_us;
+
+        let plan = accumulated.prepare_chunk(Instant::from_millis(31));
+        assert!(plan.reversal_write_x);
+        assert_eq!(plan.reversal_first_seq_x, 10);
+        assert_eq!(plan.reversal_source_seq_x, 11);
+        assert_eq!(plan.reversal_first_us_x, 16_000);
+        assert_eq!(plan.reversal_source_us_x, 31_000);
+
+        let frozen_retry = super::MouseRetry {
+            mouse: accumulated,
+            plan,
+        };
+        assert_eq!(frozen_retry.plan.reversal_source_seq_x, 11);
+        assert_eq!(frozen_retry.plan.reversal_source_us_x, 31_000);
+        assert_eq!(frozen_retry.mouse.reversal_x_confirmed_seq, 11);
+
+        accumulated.commit_chunk(frozen_retry.plan);
+        assert_eq!(accumulated.reversal_x_confirmed_seq, 0);
+        assert_eq!(accumulated.reversal_x_confirmed_us, 0);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b6_residual_and_sub_deadband_reports_cannot_seed_direction() {
+        let mut axis = DetectorAxis {
+            residual: -5_000,
+            ..DetectorAxis::default()
+        };
+        axis.feed_motion(-99, -198, 1, 1_000);
+        axis.feed_motion(-70, -140, 2, 16_000);
+        assert_eq!(axis.direction, 0);
+        axis.feed_motion(110, 220, 3, 31_000);
+        assert_eq!(axis.direction, 1);
+        assert_eq!(axis.candidate, 0);
+        assert!(!axis.write_pending);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b5_symmetric_boundary_and_first_report_semantics() {
+        for value in [99, -99] {
+            let mut axis = DetectorAxis::default();
+            axis.feed(value, 1, 1_000);
+            assert_eq!(axis.direction, 0);
+            assert_eq!(axis.candidate, 0);
+        }
+        for value in [100, 127, -100, -128] {
+            let mut axis = DetectorAxis::default();
+            axis.feed(value, 1, 1_000);
+            assert_eq!(
+                axis.direction,
+                value.signum() as i8,
+                "first report must establish direction"
+            );
+            axis.feed(-value.signum() * 100, 2, 16_000);
+            assert_eq!(axis.samples, 1);
+        }
+    }
+
+    #[cfg(all(feature = "mouse_realtime_reversal_budget_3", not(feature = "rtt_diag")))]
+    #[test]
+    fn realtime_b6_unsourced_motion_cannot_establish_detector_history() {
+        let report = |x| crate::channel::WideMouseReport {
+            buttons: 0,
+            x,
+            y: 0,
+            wheel: 0,
+            pan: 0,
+        };
+        let mut first = super::AccumulatedMouseReport::new_wide(report(110), Instant::from_millis(1));
+        first.restore_reversal_memory_and_process_first(super::ReversalMemory::default());
+        let plan = first.prepare_chunk(Instant::from_millis(2));
+        first.commit_chunk(plan);
+        let memory = first.reversal_memory();
+        assert_eq!(memory.x_direction, 0);
+
+        let mut second = super::AccumulatedMouseReport::new_wide(report(-110), Instant::from_millis(20));
+        second.restore_reversal_memory_and_process_first(memory);
+        assert_eq!(second.reversal_x_samples, 0);
+        assert_eq!(second.reversal_x_candidate, 0);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b5_four_real_flips_confirm_and_same_direction_stops_do_not() {
+        let mut axis = DetectorAxis::default();
+        let mut seq = 1u32;
+        let mut confirmed = 0;
+        for sign in [1, -1, 1, -1, 1] {
+            for _ in 0..2 {
+                axis.feed(sign * 110, seq, seq * 15_000);
+                seq += 1;
+                if axis.write_pending {
+                    confirmed += 1;
+                    axis.commit_confirmed();
+                }
+            }
+        }
+        assert_eq!(confirmed, 4);
+
+        let mut same = DetectorAxis::default();
+        for stroke in 0..5u32 {
+            same.feed(110, stroke * 10 + 1, stroke * 100_000 + 1_000);
+            same.feed(120, stroke * 10 + 2, stroke * 100_000 + 16_000);
+            assert!(!same.write_pending);
+            assert_eq!(same.direction, 1);
+        }
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b5_noise_isolated_sample_confirmation_and_axes_are_independent() {
+        let mut x = DetectorAxis::default();
+        let mut y = DetectorAxis::default();
+        x.feed(127, 1, 1_000);
+        y.feed(-128, 1, 1_000);
+        for (seq, noise) in [(2, -1), (3, -70), (4, 99)] {
+            x.feed(noise, seq, seq * 1_000);
+        }
+        assert_eq!(x.candidate, 0);
+        x.feed(-110, 5, 10_000);
+        assert_eq!(x.samples, 1);
+        assert!(!x.write_pending, "an isolated opposite sample is not confirmation");
+        x.feed(-120, 6, 25_000);
+        assert!(x.write_pending);
+        assert!(!y.write_pending);
+        assert_eq!(y.direction, -1);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b5_sequence_duplicate_gap_and_nonzero_wrap_are_explicit() {
+        let mut duplicate = DetectorAxis::default();
+        duplicate.feed(110, 9, 1_000);
+        duplicate.feed(-110, 10, 16_000);
+        duplicate.feed(-120, 10, 17_000);
+        assert_eq!(duplicate.samples, 1);
+        assert!(!duplicate.write_pending);
+
+        duplicate.feed(-130, 13, 31_000);
+        assert_eq!(duplicate.samples, 1, "a gap restarts evidence");
+        duplicate.feed(-140, 14, 46_000);
+        assert!(duplicate.write_pending);
+
+        let mut wrapped = DetectorAxis::default();
+        wrapped.feed(110, u32::MAX - 1, 1_000);
+        wrapped.feed(-110, u32::MAX, 16_000);
+        wrapped.feed(-120, 1, 31_000);
+        assert!(
+            wrapped.write_pending,
+            "sequence wrap skips reserved zero and stays contiguous"
+        );
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b4_tiny_opposite_sign_jitter_never_becomes_candidate() {
+        let mut accumulated = aged_mouse(5_000, 0, 0, 0, 0);
+        for (at, x) in [(10, -1), (11, -8)] {
+            accumulated.merge_wide(
+                crate::channel::WideMouseReport {
+                    buttons: 0,
+                    x,
+                    y: 0,
+                    wheel: 0,
+                    pan: 0,
+                    #[cfg(feature = "rtt_diag")]
+                    source: None,
+                },
+                Instant::from_millis(at),
+            );
+        }
+        assert_eq!(accumulated.x, 4_991);
+        assert_eq!(accumulated.reversal_x_candidate, 0);
+        assert!(!accumulated.reversal_x_write_pending);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b5_lone_candidate_flush_does_not_commit_direction() {
+        let mut accumulated = aged_mouse(0, 0, 0, 0, 0);
+        accumulated.reversal_x_direction = 1;
+        accumulated.reversal_x_candidate = -200;
+        accumulated.reversal_x_samples = 1;
+        accumulated.reversal_x_source_seq = 10;
+        accumulated.reversal_x_source_us = 10_000;
+        accumulated.reversal_x_first_seq = 10;
+        accumulated.reversal_x_first_us = 10_000;
+        let plan = accumulated.prepare_chunk(Instant::from_millis(11));
+        assert!(!plan.commit_reversal_x);
+        assert!(plan.reversal_unconfirmed_x);
+        assert!(!plan.reversal_write_x);
+        assert_eq!(accumulated.x, 0, "planning must not retire any residual");
+        accumulated.commit_chunk(plan);
+        while accumulated.has_relative_motion() {
+            let tail = accumulated.prepare_chunk(Instant::from_millis(12));
+            assert!(tail.reversal_unconfirmed_x);
+            accumulated.commit_chunk(tail);
+        }
+        assert_eq!(accumulated.reversal_x_direction, 1);
+        assert!(accumulated.reversal_x_candidate_flushed);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b4_confirmed_reversal_retires_only_after_success() {
+        let mut accumulated = aged_mouse(5_000, 0, 0, 0, 0);
+        accumulated.reversal_x_direction = 1;
+        accumulated.reversal_x_candidate = -440;
+        accumulated.reversal_x_samples = 2;
+        accumulated.reversal_x_write_pending = true;
+        accumulated.reversal_x_source_seq = 11;
+        accumulated.reversal_x_source_us = 11_000;
+        accumulated.reversal_x_first_seq = 10;
+        accumulated.reversal_x_first_us = 10_000;
+        let original = accumulated;
+        let first = accumulated.prepare_chunk(Instant::from_millis(12));
+        let retry = accumulated.prepare_chunk(Instant::from_millis(13));
+        assert_eq!(first.report, retry.report);
+        assert_eq!(first.remaining_x, retry.remaining_x);
+        assert!(first.report.x < 0);
+        assert!(first.commit_reversal_x);
+        assert_eq!(accumulated, original);
+
+        accumulated.commit_chunk(retry);
+        assert!(accumulated.x <= 0);
+        assert!(accumulated.x.unsigned_abs() < 440);
+        assert_eq!(accumulated.reversal_x_candidate, 0);
+        assert!(!accumulated.reversal_x_write_pending);
+        assert_eq!(accumulated.oldest_enqueued_at, Instant::from_millis(13));
+    }
+
+    #[cfg(all(
+        feature = "mouse_realtime_reversal_budget_3",
+        not(feature = "mouse_ble_16bit_report")
+    ))]
+    #[test]
+    fn realtime_b4_reversal_is_per_axis_and_preserves_diagonal_ratio() {
+        let mut accumulated = aged_mouse(5_000, 100, 0, 0, 0);
+        accumulated.reversal_x_direction = 1;
+        accumulated.reversal_x_candidate = -400;
+        accumulated.reversal_x_samples = 2;
+        accumulated.reversal_x_write_pending = true;
+        let plan = accumulated.prepare_chunk(Instant::from_millis(12));
+        assert_eq!(i32::from(plan.report.y) + plan.remaining_y, 100);
+        assert!(plan.report.x < 0);
+        assert!(plan.report.y > 0);
+        assert!(plan.commit_reversal_x);
+        assert!(!plan.commit_reversal_y);
+        accumulated.commit_chunk(plan);
+        assert_eq!(accumulated.x, plan.remaining_x);
+        assert_eq!(accumulated.y, plan.remaining_y);
+    }
+
+    #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+    #[test]
+    fn realtime_b4_keeps_wheel_pan_buttons_lossless_during_reversal() {
+        let mut accumulated = aged_mouse(5_000, 0, 300, -300, 5);
+        accumulated.reversal_x_direction = 1;
+        accumulated.reversal_x_candidate = -400;
+        accumulated.reversal_x_samples = 2;
+        accumulated.reversal_x_write_pending = true;
+        let mut wheel = 0;
+        let mut pan = 0;
+        while accumulated.has_relative_motion() {
+            let plan = accumulated.prepare_chunk(Instant::from_millis(12));
+            assert_eq!(plan.report.buttons, 5);
+            wheel += i32::from(plan.report.wheel);
+            pan += i32::from(plan.report.pan);
+            accumulated.commit_chunk(plan);
+        }
+        assert_eq!((wheel, pan), (300, -300));
+    }
+
+    #[cfg(not(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    )))]
+    #[test]
+    fn feature_off_keeps_lossless_large_residual_chunking() {
+        let mut accumulated = super::AccumulatedMouseReport {
+            buttons: 0,
+            x: 500,
+            y: -250,
+            wheel: 0,
+            pan: 0,
+            oldest_enqueued_at: Instant::from_millis(0),
+            source_reports: 1,
+            preserve_vector: true,
+            #[cfg(any(
+                feature = "mouse_realtime_burst_budget_3",
+                feature = "mouse_realtime_reversal_budget_3"
+            ))]
+            stale_vectors_remaining: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_samples: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_write_pending: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_direction: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_source_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_confirmed_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_seq: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_first_us: 0,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_x_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_y_candidate_flushed: false,
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            reversal_device_id: 0,
+        };
+        let mut total = (0i32, 0i32);
+        while accumulated.has_relative_motion() {
+            let (report, _) = accumulated.take_chunk();
+            total.0 += i32::from(report.x);
+            total.1 += i32::from(report.y);
+        }
+        assert_eq!(total, (500, -250));
+    }
+
     #[test]
     fn one_extreme_wide_queue_item_preserves_the_complete_delta() {
         let mut accumulated = super::AccumulatedMouseReport::new_wide(
@@ -3487,6 +6191,8 @@ mod tests {
                 y: i32::from(i16::MIN),
                 wheel: 0,
                 pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
             },
             Instant::now(),
         );
@@ -3716,5 +6422,70 @@ mod tests {
             .await;
             assert!(woke.get());
         });
+    }
+
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    #[test]
+    fn realtime_b8_single_notification_preserves_i16_motion_and_aux_fields() {
+        let now = Instant::from_millis(100);
+        let mut accumulated = super::AccumulatedMouseReport::new_wide(
+            crate::channel::WideMouseReport {
+                buttons: 5,
+                x: 12_345,
+                y: -23_456,
+                wheel: 200,
+                pan: -200,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            now,
+        );
+        let plan = accumulated.prepare_chunk(now + Duration::from_millis(50));
+        assert_eq!((plan.emitted_x, plan.emitted_y), (12_345, -23_456));
+        assert_eq!((plan.report.wheel, plan.report.pan), (127, -128));
+        assert_eq!((plan.remaining_x, plan.remaining_y), (0, 0));
+        assert_eq!((plan.remaining_wheel, plan.remaining_pan), (73, -72));
+        assert_eq!((plan.dropped_x, plan.dropped_y), (0, 0));
+        assert!(!plan.stale_compress);
+        assert_eq!(plan.remaining_stale_vectors, 0);
+        // Preparing/retrying is byte/state identical and does not retire data.
+        assert_eq!(plan, accumulated.prepare_chunk(now + Duration::from_millis(50)));
+        assert_eq!(
+            (accumulated.x, accumulated.y, accumulated.wheel, accumulated.pan),
+            (12_345, -23_456, 200, -200)
+        );
+        accumulated.commit_chunk(plan);
+        assert_eq!(
+            (accumulated.x, accumulated.y, accumulated.wheel, accumulated.pan),
+            (0, 0, 73, -72)
+        );
+        assert!(!cfg!(feature = "mouse_bounded_multi_notification_3"));
+    }
+
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    #[test]
+    fn realtime_b8_i16_boundary_is_lossless_across_paced_slots() {
+        let now = Instant::from_millis(1);
+        let mut accumulated = super::AccumulatedMouseReport::new_wide(
+            crate::channel::WideMouseReport {
+                buttons: 0,
+                x: -40_000,
+                y: 40_000,
+                wheel: 0,
+                pan: 0,
+                #[cfg(feature = "rtt_diag")]
+                source: None,
+            },
+            now,
+        );
+        let first = accumulated.prepare_chunk(now);
+        assert_eq!((first.emitted_x, first.emitted_y), (-32_767, 32_767));
+        assert_eq!((first.remaining_x, first.remaining_y), (-7_233, 7_233));
+        accumulated.commit_chunk(first);
+        let second = accumulated.prepare_chunk(now + Duration::from_millis(15));
+        assert_eq!((second.emitted_x, second.emitted_y), (-7_233, 7_233));
+        assert_eq!((second.remaining_x, second.remaining_y), (0, 0));
+        assert_eq!(i32::from(first.emitted_x) + i32::from(second.emitted_x), -40_000);
+        assert_eq!(i32::from(first.emitted_y) + i32::from(second.emitted_y), 40_000);
     }
 }

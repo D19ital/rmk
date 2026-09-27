@@ -19,6 +19,8 @@ use crate::config::DeviceConfig;
 use crate::core_traits::Runnable;
 #[cfg(feature = "steno")]
 use crate::hid::StenoReport;
+#[cfg(feature = "mouse_usb_16bit_report")]
+use crate::hid::UsbMouse16Report;
 #[cfg(feature = "host")]
 use crate::hid::ViaReport;
 use crate::hid::{
@@ -125,6 +127,7 @@ impl<'a, 'd, D: Driver<'d>> UsbKeyboardWriter<'a, 'd, D> {
         }
     }
 
+    #[cfg(not(feature = "mouse_usb_16bit_report"))]
     async fn write_wide_mouse(&mut self, mut mouse: WideMouseReport) {
         loop {
             let has_relative_motion = mouse.x != 0 || mouse.y != 0 || mouse.wheel != 0 || mouse.pan != 0;
@@ -143,7 +146,40 @@ impl<'a, 'd, D: Driver<'d>> UsbKeyboardWriter<'a, 'd, D> {
 
             match write_while_usb_configured(self.write_report(&report)).await {
                 Some(Ok(_)) => {}
-                Some(Err(e)) => error!("Failed to send report: {:?}", e),
+                Some(Err(e)) => {
+                    error!("Failed to send report: {:?}", e)
+                }
+                None => return,
+            }
+
+            if mouse.x == 0 && mouse.y == 0 && mouse.wheel == 0 && mouse.pan == 0 {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "mouse_usb_16bit_report")]
+    async fn write_wide_mouse(&mut self, mut mouse: WideMouseReport) {
+        loop {
+            let plan = crate::mouse_chunk::plan_usb16_chunk([mouse.x, mouse.y, mouse.wheel, mouse.pan]);
+            let report = UsbMouse16Report {
+                buttons: mouse.buttons,
+                x: plan.x,
+                y: plan.y,
+                wheel: plan.wheel,
+                pan: plan.pan,
+            };
+
+            match write_while_usb_configured(self.write_composite(CompositeReportType::Mouse, &report)).await {
+                Some(Ok(_)) => {
+                    [mouse.x, mouse.y, mouse.wheel, mouse.pan] = plan.residual;
+                }
+                Some(Err(e)) => {
+                    // Keep `mouse` untouched: the next attempt serializes the
+                    // exact same bytes and commits no residual prematurely.
+                    error!("Failed to send report: {:?}", e);
+                    continue;
+                }
                 None => return,
             }
 
@@ -187,7 +223,13 @@ impl<'d, D: Driver<'d>> HidWriterTrait for UsbKeyboardWriter<'_, 'd, D> {
                     .map_err(HidError::UsbEndpointError)?;
                 Ok(n)
             }
+            #[cfg(not(feature = "mouse_usb_16bit_report"))]
             Report::MouseReport(r) => self.write_composite(CompositeReportType::Mouse, r).await,
+            #[cfg(feature = "mouse_usb_16bit_report")]
+            Report::MouseReport(r) => {
+                let widened = UsbMouse16Report::from(*r);
+                self.write_composite(CompositeReportType::Mouse, &widened).await
+            }
             Report::MediaKeyboardReport(r) => self.write_composite(CompositeReportType::Media, r).await,
             Report::SystemControlReport(r) => self.write_composite(CompositeReportType::System, r).await,
             #[cfg(feature = "steno")]

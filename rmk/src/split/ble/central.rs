@@ -1012,6 +1012,25 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Sp
                 crate::rtt_diag::record_split_rx(event);
                 update_pointing_activity_time(event);
             }
+            #[cfg(feature = "mouse_realtime_reversal_budget_3")]
+            SplitMessage::PointingV2 { event, seq, source_us } => {
+                #[cfg(not(feature = "rtt_diag"))]
+                let _ = (seq, source_us);
+                #[cfg(feature = "rtt_diag")]
+                let meta = crate::rtt_diag::MouseSourceMeta {
+                    seq: *seq,
+                    timestamp_us: *source_us,
+                    correlation_us: 0,
+                    device_id: event.device_id,
+                    raw_x: 0,
+                    raw_y: 0,
+                };
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_split_rx(event);
+                #[cfg(feature = "rtt_diag")]
+                crate::rtt_diag::record_split_rx_source(event, meta);
+                update_pointing_activity_time(event);
+            }
             SplitMessage::Key(_) => report_activity(),
             _ => {}
         }

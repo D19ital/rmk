@@ -24,6 +24,14 @@ Product ID, Vial keyboard ID, storage, and UF2 artifact.
 
 ## Build
 
+The Standalone `production_v30g` profile preserves the `production_v22`
+runtime DPI/acceleration and split-role behavior, adds host-first split wake,
+and uses the hardware-validated pointer transport: signed 16-bit X/Y over BLE
+and USB, signed 8-bit wheel/pan, one 15 ms paced BLE notification, and
+direction-preserving reversal handling. `production_v30g_rtt_diag` enables RTT
+on that exact production feature graph rather than selecting a different
+pointer profile.
+
 ```sh
 KEYBOARD_TOML_PATH="$PWD/keyboard.toml" \
 VIAL_JSON_PATH="$PWD/vial.json" \

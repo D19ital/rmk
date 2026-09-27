@@ -18,6 +18,7 @@ use motion_pacing::{
 
 #[cfg(all(
     feature = "production_v22",
+    not(feature = "production_v30g_rtt_diag"),
     any(
         feature = "rtt_diag",
         feature = "usb_debug",
@@ -100,7 +101,7 @@ pub fn new_trackball(
     Pmw3610::new(id, spi, cs, Some(motion), config)
 }
 
-#[cfg(any(feature = "pmw_raw_600_diag", feature = "pmw_axes_600_diag"))]
+#[cfg(feature = "pmw_raw_600_diag")]
 fn configured_ball_cpi(_device_id: u8) -> u16 {
     600
 }
@@ -110,11 +111,7 @@ fn configured_ball_cpi(_device_id: u8) -> u16 {
     1000
 }
 
-#[cfg(not(any(
-    feature = "pmw_raw_600_diag",
-    feature = "pmw_raw_1000_diag",
-    feature = "pmw_axes_600_diag"
-)))]
+#[cfg(not(any(feature = "pmw_raw_600_diag", feature = "pmw_raw_1000_diag")))]
 fn configured_ball_cpi(device_id: u8) -> u16 {
     module_settings::ball_cpi(device_id)
 }
@@ -152,6 +149,10 @@ pub struct Trackball {
     last_vbus_detect: Option<bool>,
     recovery_pending: bool,
     recovery_count: u32,
+    #[cfg(feature = "rtt_diag")]
+    source_seq: u32,
+    #[cfg(feature = "rtt_diag")]
+    last_source_timestamp_us: u32,
 }
 
 impl Trackball {
@@ -185,6 +186,10 @@ impl Trackball {
             last_vbus_detect: None,
             recovery_pending: false,
             recovery_count: 0,
+            #[cfg(feature = "rtt_diag")]
+            source_seq: 0,
+            #[cfg(feature = "rtt_diag")]
+            last_source_timestamp_us: 0,
         }
     }
 
@@ -435,6 +440,10 @@ impl Trackball {
                             }
                             if output_dx != 0 || output_dy != 0 {
                                 self.last_motion_activity = Some(now);
+                                #[cfg(feature = "rtt_diag")]
+                                {
+                                    self.last_source_timestamp_us = now.as_micros().min(u64::from(u32::MAX)) as u32;
+                                }
                             }
                             if sleeping && self.acc_x == 0 && self.acc_y == 0 && (output_dx != 0 || output_dy != 0) {
                                 self.sleep_motion_deadline = Some(now + SLEEP_MOTION_WINDOW);
@@ -681,6 +690,21 @@ impl Trackball {
             self.sleep_motion_deadline = None;
         }
 
+        #[cfg(feature = "rtt_diag")]
+        {
+            self.source_seq = self.source_seq.wrapping_add(1);
+            if self.source_seq == 0 {
+                self.source_seq = 1;
+            }
+            rmk::rtt_diag::record_pmw_publish(
+                self.source_seq,
+                self.last_source_timestamp_us,
+                self.device_id,
+                report_x,
+                report_y,
+                !self.is_central,
+            );
+        }
         publish_event(PointingEvent {
             device_id: self.device_id,
             axes: [
@@ -701,8 +725,6 @@ impl Trackball {
                 },
             ],
         });
-        #[cfg(feature = "rtt_diag")]
-        rmk::rtt_diag::record_pmw_publish();
     }
 }
 
@@ -752,7 +774,7 @@ impl RttSchedulerProbe {
     async fn run_loop(&mut self) -> ! {
         #[cfg(feature = "pmw_axes_600_diag")]
         defmt::info!(
-            "[RIGHT_DIAG_V22] mode=split_radio_aligned_pacing cpi=600 hardware_swap=false software_swap=true report_us=15000 split_link_us=7500 windows_per_report=2 delta=i16_full accum_min=-32768 accum_max=32767 hid_us=7500 vector=preserve health_ms=1000 smart=on force_awake=off"
+            "[RIGHT_DIAG_V22] mode=split_radio_aligned_pacing cpi=runtime_200_3200 acceleration=runtime hardware_swap=false software_swap=true report_us=15000 split_link_us=7500 windows_per_report=2 delta=i16_full accum_min=-32768 accum_max=32767 hid_us=7500 vector=preserve health_ms=1000 smart=on force_awake=off"
         );
         #[cfg(feature = "pmw_raw_600_diag")]
         defmt::info!("[RIGHT_DIAG_V13] mode=pmw_raw_sign cpi=600 smart=on force_awake=off");

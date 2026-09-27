@@ -102,7 +102,10 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
 
         loop {
             if let Some(event) = pending_pointing.take() {
+                #[cfg(not(feature = "rtt_diag"))]
                 let (event, pending) = coalesce_queued_pointing(event, || pointing_sub.try_next_message_pure());
+                #[cfg(feature = "rtt_diag")]
+                let (event, pending) = (event, None);
                 pending_pointing = pending;
                 trace!("Writing pending split pointing message to central");
                 self.split_driver.write(&SplitMessage::Pointing(event)).await.ok();
@@ -119,8 +122,11 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         }.into())
                     },
                     e = pointing_sub.next_message_pure().fuse() => {
+                        #[cfg(not(feature = "rtt_diag"))]
                         let (event, pending) =
                             coalesce_queued_pointing(e, || pointing_sub.try_next_message_pure());
+                        #[cfg(feature = "rtt_diag")]
+                        let (event, pending) = (e, None);
                         pending_pointing = pending;
                         SplitMessage::Pointing(event)
                     },

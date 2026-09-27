@@ -43,6 +43,8 @@ pub(crate) struct WideMouseReport {
     pub(crate) y: i32,
     pub(crate) wheel: i32,
     pub(crate) pan: i32,
+    #[cfg(feature = "rtt_diag")]
+    pub(crate) source: Option<crate::rtt_diag::MouseSourceMeta>,
 }
 
 #[derive(Debug)]
@@ -67,6 +69,8 @@ impl QueuedReport {
                 y: i32::from(y),
                 wheel: i32::from(wheel),
                 pan: i32::from(pan),
+                #[cfg(feature = "rtt_diag")]
+                source: None,
             }),
             enqueued_at: Instant::now(),
         }
@@ -159,6 +163,22 @@ pub async fn send_hid_report(report: Report) {
 /// delta into many i8 reports.
 pub(crate) async fn send_hid_mouse_report(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
     enqueue_hid_report(QueuedReport::new_wide_mouse(buttons, x, y, wheel, pan), true).await;
+}
+
+#[cfg(feature = "rtt_diag")]
+pub(crate) async fn send_hid_mouse_report_sourced(
+    buttons: u8,
+    x: i16,
+    y: i16,
+    wheel: i16,
+    pan: i16,
+    source: Option<crate::rtt_diag::MouseSourceMeta>,
+) {
+    let mut queued = QueuedReport::new_wide_mouse(buttons, x, y, wheel, pan);
+    if let QueuedReportPayload::WideMouse(report) = &mut queued.payload {
+        report.source = source;
+    }
+    enqueue_hid_report(queued, true).await;
 }
 
 async fn enqueue_hid_report(mut queued_report: QueuedReport, _diag_is_mouse: bool) {

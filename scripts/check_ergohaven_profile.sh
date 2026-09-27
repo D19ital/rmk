@@ -478,8 +478,35 @@ entry = Path("rmk-macro/src/codegen/entry.rs").read_text(encoding="utf-8")
 ble = Path("rmk/src/ble/mod.rs").read_text(encoding="utf-8")
 split = Path("rmk/src/split/ble/central.rs").read_text(encoding="utf-8")
 central = Path("rmk/src/split/central.rs").read_text(encoding="utf-8")
-assert 'production_v30g = ["production_v22", "fixed_mouse_pacing_15ms", "rmk/host_first_split_wake"]' in k04
+trackball = Path("keyboards/k04/src/trackball.rs").read_text(encoding="utf-8")
+assert 'production_v30g = ["production_v22", "mouse_realtime_b11", "rmk/host_first_split_wake"]' in k04
+assert '''[profile.defmt-release]
+inherits = "release"
+strip = "debuginfo"''' in k04
+defmt_check = Path("scripts/check_defmt_elf.sh").read_text(encoding="utf-8")
+assert "expected exactly one '_defmt_version_ = 4' symbol" in defmt_check
+assert 'production_v30g_rtt_diag = ["production_v30g", "rtt_diag"]' in k04
+assert 'mouse_realtime_b11 = ["mouse_realtime_b8", "mouse_usb_16bit_report"]' in k04
+assert 'mouse_realtime_b8 = ["mouse_realtime_reversal_budget_3", "fixed_mouse_pacing_15ms", "rmk/mouse_ble_16bit_report"]' in k04
 assert 'fixed_mouse_pacing_15ms = ["mouse_vector_preserve", "rmk/fixed_mouse_pacing_15ms"]' in k04
+assert "deadband=100" in ble
+assert "remaining_stale_vectors" in ble
+for obsolete in (
+    "mouse_realtime_b5_diag",
+    "mouse_realtime_b6_diag",
+    "mouse_realtime_b7_diag",
+    "mouse_usb_b9_diag",
+):
+    assert obsolete not in k04
+assert '''#[cfg(feature = "pmw_raw_600_diag")]
+fn configured_ball_cpi(_device_id: u8) -> u16 {
+    600
+}''' in trackball
+assert '''#[cfg(not(any(feature = "pmw_raw_600_diag", feature = "pmw_raw_1000_diag")))]
+fn configured_ball_cpi(device_id: u8) -> u16 {
+    module_settings::ball_cpi(device_id)
+}''' in trackball
+assert "cpi=runtime_200_3200 acceleration=runtime" in trackball
 assert 'host_first_split_wake = []' in rmk
 assert 'production_v30g' not in rmk
 assert "adaptive_mouse_pacing" not in k04 + rmk
@@ -909,6 +936,28 @@ for tool in settings_reset storage_migrate; do
     rg -q 'FLASH[[:space:]]*:[[:space:]]*ORIGIN[[:space:]]*=[[:space:]]*0x00001000' "tools/$tool/memory_qube.x" \
         || fail "tools/$tool/memory_qube.x: application origin must be 0x1000"
 done
+
+python3 - <<'PY' || fail "K:04 B8/B11 production contract is invalid"
+from pathlib import Path
+
+k04 = Path("keyboards/k04/Cargo.toml").read_text()
+rmk = Path("rmk/Cargo.toml").read_text()
+lib = Path("rmk/src/lib.rs").read_text()
+usb = Path("rmk/src/usb/mod.rs").read_text()
+chunk = Path("rmk/src/mouse_chunk.rs").read_text()
+pacing = Path("keyboards/k04/src/trackball/motion_pacing.rs").read_text()
+
+assert 'production_v30g = ["production_v22", "mouse_realtime_b11", "rmk/host_first_split_wake"]' in k04
+assert 'production_v30g_rtt_diag = ["production_v30g", "rtt_diag"]' in k04
+assert 'mouse_realtime_b11 = ["mouse_realtime_b8", "mouse_usb_16bit_report"]' in k04
+assert 'mouse_usb_16bit_report = ["rmk/mouse_usb_16bit_report"]' in k04
+assert 'mouse_usb_16bit_report = []' in rmk
+assert "mouse_usb_b9_diag" not in k04 + rmk + lib + usb
+assert 'plan_usb16_chunk([mouse.x, mouse.y, mouse.wheel, mouse.pan])' in usb
+assert '#[cfg(not(feature = "mouse_usb_16bit_report"))]\n    async fn write_wide_mouse' in usb
+assert 'b11_typical_xy_uses_one_report_not_b9_b10_i8_chunks' in chunk
+assert 'cfg!(feature = "mouse_realtime_b11")' in pacing
+PY
 
 if ((failures > 0)); then
     echo "Ergohaven firmware profile contract failed with $failures error(s)." >&2

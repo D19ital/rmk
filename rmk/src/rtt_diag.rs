@@ -24,6 +24,13 @@ const RAW_NEAR_SATURATION_ABS: u16 = 1_900;
 static NEXT_RIGHT_LOG_MS: AtomicU32 = AtomicU32::new(0);
 static PMW_READS: AtomicU32 = AtomicU32::new(0);
 static PMW_PUBLISHES: AtomicU32 = AtomicU32::new(0);
+static MOUSE_SOURCE_SEQ: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static MOUSE_SOURCE_TS_US: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static MOUSE_SOURCE_CORRELATION_US: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static MOUSE_SOURCE_X: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
+static MOUSE_SOURCE_Y: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
+static MOUSE_SOURCE_FOR_SPLIT_VALID: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+static MOUSE_SOURCE_FOR_PROCESS_VALID: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 static PMW_ERRORS: AtomicU32 = AtomicU32::new(0);
 static PMW_DX: AtomicI32 = AtomicI32::new(0);
 static PMW_DY: AtomicI32 = AtomicI32::new(0);
@@ -166,6 +173,30 @@ static HID_GATT_TOTAL_US: AtomicU32 = AtomicU32::new(0);
 static HID_GATT_WAIT_OVER_10_MS: AtomicU32 = AtomicU32::new(0);
 static HID_GATT_WAIT_STREAK_CURRENT: AtomicU32 = AtomicU32::new(0);
 static HID_GATT_WAIT_STREAK_MAX: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+static HID_STALE_COMPRESS: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+static HID_STALE_DROP_X: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+static HID_STALE_DROP_Y: AtomicU32 = AtomicU32::new(0);
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+static HID_STALE_COMPRESS_AGE_MAX_US: AtomicU32 = AtomicU32::new(0);
 
 #[inline]
 fn now_ms() -> u32 {
@@ -454,12 +485,120 @@ pub fn record_pmw_error() {
     maybe_log_right(now_ms());
 }
 
-/// Record one PointingEvent published by the K:04 trackball task.
-pub fn record_pmw_publish() {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MouseSourceMeta {
+    pub(crate) seq: u32,
+    pub(crate) timestamp_us: u32,
+    /// Timestamp in the central half's clock domain: local publication for
+    /// LEFT, split receive for RIGHT. Never subtract the remote clock.
+    pub(crate) correlation_us: u32,
+    pub(crate) device_id: u8,
+    /// Immutable pre-runtime-transform source-space axes.  B6 reversal
+    /// evidence must never be reconstructed from accelerated HID movement.
+    pub(crate) raw_x: i32,
+    pub(crate) raw_y: i32,
+}
+
+fn store_mouse_source(meta: MouseSourceMeta, x: i32, y: i32, for_split: bool) {
+    let slot = usize::from(meta.device_id.min(3));
+    MOUSE_SOURCE_TS_US[slot].store(meta.timestamp_us, Ordering::Relaxed);
+    MOUSE_SOURCE_CORRELATION_US[slot].store(meta.correlation_us, Ordering::Relaxed);
+    MOUSE_SOURCE_X[slot].store(x, Ordering::Relaxed);
+    MOUSE_SOURCE_Y[slot].store(y, Ordering::Relaxed);
+    MOUSE_SOURCE_SEQ[slot].store(meta.seq, Ordering::Release);
+    if for_split {
+        MOUSE_SOURCE_FOR_SPLIT_VALID[slot].store(true, Ordering::Release);
+    } else {
+        MOUSE_SOURCE_FOR_PROCESS_VALID[slot].store(true, Ordering::Release);
+    }
+}
+
+fn take_mouse_source(event: &PointingEvent, for_split: bool) -> Option<MouseSourceMeta> {
+    let slot = usize::from(event.device_id.min(3));
+    let valid = if for_split {
+        &MOUSE_SOURCE_FOR_SPLIT_VALID[slot]
+    } else {
+        &MOUSE_SOURCE_FOR_PROCESS_VALID[slot]
+    };
+    if !valid.load(Ordering::Acquire) {
+        return None;
+    }
+    let (x, y) = axis_totals(event);
+    if MOUSE_SOURCE_X[slot].load(Ordering::Relaxed) != i32::from(x)
+        || MOUSE_SOURCE_Y[slot].load(Ordering::Relaxed) != i32::from(y)
+    {
+        return None;
+    }
+    valid.store(false, Ordering::Release);
+    Some(MouseSourceMeta {
+        seq: MOUSE_SOURCE_SEQ[slot].load(Ordering::Acquire),
+        timestamp_us: MOUSE_SOURCE_TS_US[slot].load(Ordering::Relaxed),
+        correlation_us: MOUSE_SOURCE_CORRELATION_US[slot].load(Ordering::Relaxed),
+        device_id: event.device_id,
+        raw_x: MOUSE_SOURCE_X[slot].load(Ordering::Relaxed),
+        raw_y: MOUSE_SOURCE_Y[slot].load(Ordering::Relaxed),
+    })
+}
+
+pub(crate) fn take_mouse_source_for_split(event: &PointingEvent) -> Option<MouseSourceMeta> {
+    take_mouse_source(event, true)
+}
+
+pub(crate) fn take_mouse_source_for_processor(event: &PointingEvent) -> Option<MouseSourceMeta> {
+    take_mouse_source(event, false)
+}
+
+/// Record one K:04 source publication before local or split processing.
+pub fn record_pmw_publish(seq: u32, source_timestamp_us: u32, device_id: u8, x: i16, y: i16, for_split: bool) {
     let now = now_ms();
     PMW_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     record_bounded_gap(&LAST_PMW_PUBLISH_MS, &PMW_PUBLISH_MAX_GAP_MS, now);
+    let meta = MouseSourceMeta {
+        seq,
+        timestamp_us: source_timestamp_us,
+        correlation_us: now_us(),
+        device_id,
+        raw_x: i32::from(x),
+        raw_y: i32::from(y),
+    };
+    store_mouse_source(meta, i32::from(x), i32::from(y), for_split);
+    let side = if for_split { b'R' } else { b'L' };
+    defmt::info!(
+        "[MOUSE_B5_SOURCE] event=source seq={} source_t_us={} side={} device={} axis={} value={}",
+        seq,
+        source_timestamp_us,
+        side,
+        device_id,
+        b'x',
+        x
+    );
+    defmt::info!(
+        "[MOUSE_B5_SOURCE] event=source seq={} source_t_us={} side={} device={} axis={} value={}",
+        seq,
+        source_timestamp_us,
+        side,
+        device_id,
+        b'y',
+        y
+    );
     maybe_log_right(now);
+}
+
+pub(crate) fn record_split_rx_source(event: &PointingEvent, mut meta: MouseSourceMeta) {
+    let (x, y) = axis_totals(event);
+    meta.correlation_us = now_us();
+    meta.raw_x = i32::from(x);
+    meta.raw_y = i32::from(y);
+    store_mouse_source(meta, i32::from(x), i32::from(y), false);
+    defmt::info!(
+        "[MOUSE_E2E_V1] event=split_receive seq={} source_t_us={} receive_t_us={} device={} x={} y={}",
+        meta.seq,
+        meta.timestamp_us,
+        now_us(),
+        meta.device_id,
+        x,
+        y
+    );
 }
 
 /// Record motion that could not fit in the widened trackball accumulator.
@@ -472,7 +611,22 @@ pub fn record_pmw_accum_drop(dropped_x: u32, dropped_y: u32) {
 /// Record completion of a peripheral-to-central BLE split notification.
 pub(crate) fn record_split_tx(message: &SplitMessage, elapsed_us: u32, ok: bool) {
     let now = now_ms();
-    if let SplitMessage::Pointing(event) = message {
+    let pointing = match message {
+        SplitMessage::Pointing(event) => Some(event),
+        SplitMessage::PointingV2 { event, seq, source_us } => {
+            defmt::info!(
+                "[MOUSE_E2E_V1] event=split_tx seq={} source_t_us={} tx_done_t_us={} ok={} elapsed_us={}",
+                seq,
+                source_us,
+                now_us(),
+                ok,
+                elapsed_us
+            );
+            Some(event)
+        }
+        _ => None,
+    };
+    if let Some(event) = pointing {
         let (x, y) = axis_totals(event);
         SPLIT_TX_POINTING.fetch_add(1, Ordering::Relaxed);
         add_i32(&SPLIT_TX_DX, x);
@@ -537,33 +691,63 @@ pub(crate) fn record_hid_write(
     queue_len: usize,
     motion_age_us: u32,
     source_reports: u32,
+    aggregate: Option<(i32, i32, i32, i32)>,
+    source: Option<MouseSourceMeta>,
 ) {
     HID_WRITE_ALL.fetch_add(1, Ordering::Relaxed);
     if let Report::MouseReport(mouse) = report {
-        HID_WRITE_MOUSE.fetch_add(1, Ordering::Relaxed);
-        add_i32(&HID_WRITE_DX, i16::from(mouse.x));
-        add_i32(&HID_WRITE_DY, i16::from(mouse.y));
-        HID_MOUSE_SOURCE_REPORTS.fetch_add(source_reports, Ordering::Relaxed);
-        HID_MOUSE_AGE_SAMPLES.fetch_add(1, Ordering::Relaxed);
-        HID_MOUSE_AGE_TOTAL_US.fetch_add(motion_age_us, Ordering::Relaxed);
-        HID_MOUSE_AGE_MAX_US.fetch_max(motion_age_us, Ordering::Relaxed);
-        if motion_age_us >= 15_000 {
-            HID_MOUSE_AGE_OVER_15_MS.fetch_add(1, Ordering::Relaxed);
-        }
-        if motion_age_us >= 30_000 {
-            HID_MOUSE_AGE_OVER_30_MS.fetch_add(1, Ordering::Relaxed);
-        }
-        if motion_age_us >= 100_000 {
-            HID_MOUSE_AGE_OVER_100_MS.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let now = now_us();
-        let previous = LAST_MOUSE_WRITE_US.swap(now, Ordering::Relaxed);
-        if previous != 0 {
-            let gap = now.wrapping_sub(previous);
-            if gap <= MAX_RELEVANT_GAP_MS.saturating_mul(1_000) {
-                HID_MOUSE_WRITE_GAP_MAX_US.fetch_max(gap, Ordering::Relaxed);
+        if ok {
+            HID_WRITE_MOUSE.fetch_add(1, Ordering::Relaxed);
+            add_i32(&HID_WRITE_DX, i16::from(mouse.x));
+            add_i32(&HID_WRITE_DY, i16::from(mouse.y));
+            HID_MOUSE_SOURCE_REPORTS.fetch_add(source_reports, Ordering::Relaxed);
+            HID_MOUSE_AGE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            HID_MOUSE_AGE_TOTAL_US.fetch_add(motion_age_us, Ordering::Relaxed);
+            HID_MOUSE_AGE_MAX_US.fetch_max(motion_age_us, Ordering::Relaxed);
+            if motion_age_us >= 15_000 {
+                HID_MOUSE_AGE_OVER_15_MS.fetch_add(1, Ordering::Relaxed);
             }
+            if motion_age_us >= 30_000 {
+                HID_MOUSE_AGE_OVER_30_MS.fetch_add(1, Ordering::Relaxed);
+            }
+            if motion_age_us >= 100_000 {
+                HID_MOUSE_AGE_OVER_100_MS.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let now = now_us();
+            let previous = LAST_MOUSE_WRITE_US.swap(now, Ordering::Relaxed);
+            if previous != 0 {
+                let gap = now.wrapping_sub(previous);
+                if gap <= MAX_RELEVANT_GAP_MS.saturating_mul(1_000) {
+                    HID_MOUSE_WRITE_GAP_MAX_US.fetch_max(gap, Ordering::Relaxed);
+                }
+            }
+            let (input_x, input_y, residual_x, residual_y) = aggregate.unwrap_or((0, 0, 0, 0));
+            let source = source.unwrap_or_default();
+            let source_to_hid_us = if source.seq == 0 {
+                0
+            } else {
+                now.wrapping_sub(source.correlation_us)
+            };
+            defmt::info!(
+                "[MOUSE_B5_HID] event=hid_ok hid_t_us={} seq={} source_t_us={} correlation_t_us={} source_to_hid_us={} device={} x={} y={} wheel={} pan={} input_x={} input_y={} residual_x={} residual_y={} age_us={} source_reports={}",
+                now,
+                source.seq,
+                source.timestamp_us,
+                source.correlation_us,
+                source_to_hid_us,
+                source.device_id,
+                mouse.x,
+                mouse.y,
+                mouse.wheel,
+                mouse.pan,
+                input_x,
+                input_y,
+                residual_x,
+                residual_y,
+                motion_age_us,
+                source_reports
+            );
         }
     }
     if !ok {
@@ -624,6 +808,262 @@ pub(crate) fn record_mouse_slot_wait(elapsed_us: u32) {
     }
     HID_MOUSE_SLOT_WAITS.fetch_add(1, Ordering::Relaxed);
     HID_MOUSE_SLOT_WAIT_MAX_US.fetch_max(elapsed_us, Ordering::Relaxed);
+}
+
+/// Record the exact B8 BLE-private payload after stack acceptance or on
+/// failure. This is intentionally separate from the generic i8 HID marker so
+/// hardware logs can prove one 16-bit vector per paced slot.
+#[cfg(feature = "mouse_ble_16bit_report")]
+pub(crate) fn record_mouse_b8_handoff(
+    ok: bool,
+    report: &crate::hid::BleMouse16Report,
+    input_x: i32,
+    input_y: i32,
+    residual_x: i32,
+    residual_y: i32,
+    age_us: u32,
+    source_reports: u32,
+    source: Option<MouseSourceMeta>,
+    gatt_us: u32,
+    queue_len: usize,
+) {
+    HID_WRITE_ALL.fetch_add(1, Ordering::Relaxed);
+    HID_WRITE_MAX_US.fetch_max(gatt_us, Ordering::Relaxed);
+    HID_GATT_TOTAL_US.fetch_add(gatt_us, Ordering::Relaxed);
+    HID_QUEUE_HIGH_WATER.fetch_max(queue_len as u32, Ordering::Relaxed);
+    if gatt_us >= SLOW_GATT_US {
+        HID_WRITE_SLOW.fetch_add(1, Ordering::Relaxed);
+    }
+    if gatt_us >= WAITING_GATT_US {
+        HID_GATT_WAIT_OVER_10_MS.fetch_add(1, Ordering::Relaxed);
+        let streak = HID_GATT_WAIT_STREAK_CURRENT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        HID_GATT_WAIT_STREAK_MAX.fetch_max(streak, Ordering::Relaxed);
+    } else {
+        HID_GATT_WAIT_STREAK_CURRENT.store(0, Ordering::Relaxed);
+    }
+    if ok {
+        HID_WRITE_MOUSE.fetch_add(1, Ordering::Relaxed);
+        add_i32(&HID_WRITE_DX, report.x);
+        add_i32(&HID_WRITE_DY, report.y);
+        HID_MOUSE_SOURCE_REPORTS.fetch_add(source_reports, Ordering::Relaxed);
+        HID_MOUSE_AGE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        HID_MOUSE_AGE_TOTAL_US.fetch_add(age_us, Ordering::Relaxed);
+        HID_MOUSE_AGE_MAX_US.fetch_max(age_us, Ordering::Relaxed);
+        if age_us >= 15_000 {
+            HID_MOUSE_AGE_OVER_15_MS.fetch_add(1, Ordering::Relaxed);
+        }
+        if age_us >= 30_000 {
+            HID_MOUSE_AGE_OVER_30_MS.fetch_add(1, Ordering::Relaxed);
+        }
+        if age_us >= 100_000 {
+            HID_MOUSE_AGE_OVER_100_MS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else {
+        HID_WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    let now = now_us();
+    let source = source.unwrap_or_default();
+    let source_to_hid_us = if source.seq == 0 {
+        0
+    } else {
+        now.wrapping_sub(source.correlation_us)
+    };
+    defmt::info!(
+        "[MOUSE_B8_HID_V1] event=stack_handoff t_us={} ok={} seq={} source_t_us={} correlation_t_us={} source_to_hid_us={} device={} buttons={} x={} y={} wheel={} pan={} input_x={} input_y={} residual_x={} residual_y={} age_us={} source_reports={} gatt_us={} queue_len={} payload_bytes=7",
+        now,
+        ok,
+        source.seq,
+        source.timestamp_us,
+        source.correlation_us,
+        source_to_hid_us,
+        source.device_id,
+        report.buttons,
+        report.x,
+        report.y,
+        report.wheel,
+        report.pan,
+        input_x,
+        input_y,
+        residual_x,
+        residual_y,
+        age_us,
+        source_reports,
+        gatt_us,
+        queue_len
+    );
+}
+
+/// Record each completed stack handoff in the bounded B7 stale burst.
+/// `decision`: 0=continue frozen burst, 1=budget exhausted,
+/// 2=stale epoch drained, 5=GATT failure.
+#[cfg(feature = "mouse_bounded_multi_notification_3")]
+pub(crate) fn record_mouse_burst_notification(
+    slot: u32,
+    index: u8,
+    ok: bool,
+    report: &usbd_hid::descriptor::MouseReport,
+    residual_x: i32,
+    residual_y: i32,
+    remaining_stale_vectors: u8,
+    queue_len: usize,
+    decision: u8,
+) {
+    defmt::info!(
+        "[MOUSE_BURST_B7_V1] event=stack_handoff t_us={} slot={} index={} budget=3 ok={} x={} y={} wheel={} pan={} residual_x={} residual_y={} stale_vectors_remaining={} queue_len={} decision={}",
+        now_us(),
+        slot,
+        index,
+        ok,
+        report.x,
+        report.y,
+        report.wheel,
+        report.pan,
+        residual_x,
+        residual_y,
+        remaining_stale_vectors,
+        queue_len,
+        decision
+    );
+}
+
+#[cfg(any(
+    feature = "mouse_realtime_age_cap_30ms",
+    feature = "mouse_realtime_burst_budget_3",
+    feature = "mouse_realtime_reversal_budget_3"
+))]
+pub(crate) fn record_stale_mouse_compress(dropped_x: u32, dropped_y: u32, age_us: u32) {
+    HID_STALE_COMPRESS.fetch_add(1, Ordering::Relaxed);
+    HID_STALE_DROP_X.fetch_add(dropped_x, Ordering::Relaxed);
+    HID_STALE_DROP_Y.fetch_add(dropped_y, Ordering::Relaxed);
+    HID_STALE_COMPRESS_AGE_MAX_US.fetch_max(age_us, Ordering::Relaxed);
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+pub(crate) fn record_mouse_reversal_candidate(
+    axis: u8,
+    device: u8,
+    residual: i32,
+    raw_input: i32,
+    first_seq: u32,
+    first_us: u32,
+) {
+    let side = if device == 0 { b'L' } else { b'R' };
+    defmt::info!(
+        "[MOUSE_REV_B6_V1] event=disposition disposition=candidate t_us={} side={} device={} axis={} residual={} raw_input={} deadband=100 first_seq={} first_t_us={}",
+        now_us(),
+        side,
+        device,
+        axis,
+        residual,
+        raw_input,
+        first_seq,
+        first_us
+    );
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_mouse_reversal_confirm(
+    axis: u8,
+    device: u8,
+    candidate: i32,
+    samples: u8,
+    first_seq: u32,
+    first_us: u32,
+    second_seq: u32,
+    second_us: u32,
+) {
+    let side = if device == 0 { b'L' } else { b'R' };
+    defmt::info!(
+        "[MOUSE_REV_B6_V1] event=disposition disposition=confirmed t_us={} side={} device={} axis={} candidate={} samples={} first_seq={} first_t_us={} second_seq={} second_t_us={}",
+        now_us(),
+        side,
+        device,
+        axis,
+        candidate,
+        samples,
+        first_seq,
+        first_us,
+        second_seq,
+        second_us
+    );
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_mouse_reversal_write(
+    axis: u8,
+    device: u8,
+    value: i8,
+    first_seq: u32,
+    first_us: u32,
+    second_seq: u32,
+    second_us: u32,
+) {
+    let side = if device == 0 { b'L' } else { b'R' };
+    defmt::info!(
+        "[MOUSE_REV_B6_V1] event=hid_ok disposition=confirmed t_us={} side={} device={} axis={} value={} first_seq={} first_t_us={} second_seq={} second_t_us={}",
+        now_us(),
+        side,
+        device,
+        axis,
+        value,
+        first_seq,
+        first_us,
+        second_seq,
+        second_us
+    );
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+pub(crate) fn record_mouse_reversal_cancel(
+    axis: u8,
+    device: u8,
+    first_seq: u32,
+    first_us: u32,
+    current_seq: u32,
+    current_us: u32,
+) {
+    let side = if device == 0 { b'L' } else { b'R' };
+    defmt::info!(
+        "[MOUSE_REV_B6_V1] event=disposition disposition=cancelled t_us={} side={} device={} axis={} first_seq={} first_t_us={} current_seq={} current_t_us={}",
+        now_us(),
+        side,
+        device,
+        axis,
+        first_seq,
+        first_us,
+        current_seq,
+        current_us
+    );
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+pub(crate) fn record_mouse_reversal_epoch(axis: u8, device: u8, source_seq: u32, source_us: u32) {
+    let side = if device == 0 { b'L' } else { b'R' };
+    defmt::info!(
+        "[MOUSE_REV_B6_V1] event=epoch disposition=baseline_after_idle t_us={} side={} device={} axis={} source_seq={} source_t_us={} idle_us=1000000",
+        now_us(),
+        side,
+        device,
+        axis,
+        source_seq,
+        source_us
+    );
+}
+
+#[cfg(feature = "mouse_realtime_reversal_budget_3")]
+pub(crate) fn record_mouse_reversal_unconfirmed_flush(axis: u8, value: i8, source_seq: u32, source_us: u32) {
+    defmt::info!(
+        "[MOUSE_REV_V2] event=hid_ok disposition=unconfirmed_flush t_us={} axis={} value={} retired_old_residual=false source_seq={} source_t_us={}",
+        now_us(),
+        axis,
+        value,
+        source_seq,
+        source_us
+    );
 }
 
 fn maybe_log_right(now: u32) {
@@ -822,5 +1262,17 @@ fn maybe_log_left(now: u32) {
         HID_GATT_WAIT_STREAK_MAX.swap(0, Ordering::Relaxed),
         HID_GATT_TOTAL_US.swap(0, Ordering::Relaxed),
         HID_WRITE_ERRORS.swap(0, Ordering::Relaxed),
+    );
+    #[cfg(any(
+        feature = "mouse_realtime_age_cap_30ms",
+        feature = "mouse_realtime_burst_budget_3",
+        feature = "mouse_realtime_reversal_budget_3"
+    ))]
+    defmt::info!(
+        "[MOUSE_STALE_V1] stale_compress={} stale_drop_x={} stale_drop_y={} stale_age_max_us={}",
+        HID_STALE_COMPRESS.swap(0, Ordering::Relaxed),
+        HID_STALE_DROP_X.swap(0, Ordering::Relaxed),
+        HID_STALE_DROP_Y.swap(0, Ordering::Relaxed),
+        HID_STALE_COMPRESS_AGE_MAX_US.swap(0, Ordering::Relaxed),
     );
 }

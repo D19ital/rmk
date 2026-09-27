@@ -121,6 +121,22 @@ mouse_interval_control = []
 ## retaining BLE pacing from mouse_interval_control.
 mouse_vector_preserve = ["mouse_interval_control"]
 
+## Internal regression profiles retained to verify that the production
+## reversal/B8 behavior does not regress to earlier stale-tail strategies.
+mouse_realtime_age_cap_30ms = ["mouse_vector_preserve"]
+mouse_realtime_burst_budget_3 = ["mouse_vector_preserve"]
+mouse_bounded_multi_notification_3 = ["mouse_realtime_reversal_budget_3", "fixed_mouse_pacing_15ms"]
+
+## B2 budget plus confirmed per-axis BLE residual reversal retirement.
+mouse_realtime_reversal_budget_3 = ["mouse_vector_preserve"]
+
+## Diagnostic: use signed 16-bit BLE mouse X/Y in one paced notification.
+mouse_ble_16bit_report = ["mouse_realtime_reversal_budget_3", "fixed_mouse_pacing_15ms"]
+
+## USB-only Report ID 2 with signed 16-bit X/Y and signed 8-bit wheel/pan.
+## BLE keeps its independently selected report map and payload path.
+mouse_usb_16bit_report = []
+
 ## Keep vector-preserving mouse HID traffic at one report per 15 ms slot.
 fixed_mouse_pacing_15ms = ["mouse_vector_preserve"]
 

@@ -12,6 +12,8 @@ use rmk_types::keycode::HidKeyCode;
 use rmk_types::keycode::KeyCode;
 use usbd_hid::descriptor::MouseReport;
 
+#[cfg(feature = "rtt_diag")]
+use crate::channel::send_hid_mouse_report_sourced;
 use crate::channel::{send_hid_mouse_report, send_hid_report};
 use crate::core_traits::Runnable;
 #[cfg(feature = "split")]
@@ -1076,6 +1078,11 @@ impl<'a> QubePointingModeProcessor<'a> {
             return;
         };
 
+        #[cfg(feature = "rtt_diag")]
+        let source_meta = crate::rtt_diag::take_mouse_source_for_processor(&event);
+        #[cfg(not(feature = "rtt_diag"))]
+        let source_meta = ();
+
         #[cfg(feature = "_ble")]
         crate::ble::sleep::report_pointing_activity(&event);
 
@@ -1142,11 +1149,11 @@ impl<'a> QubePointingModeProcessor<'a> {
         }
 
         match mode {
-            QubePointingMode::Normal => send_mouse_report(buttons, 0, x, y, 0, 0).await,
+            QubePointingMode::Normal => send_sourced_mouse_report(buttons, 0, x, y, 0, 0, source_meta).await,
             QubePointingMode::Sniper => {
                 let divisor = self.settings.sens(source.side, QubePointingMode::Sniper);
                 let (x, y) = qube_divided_motion(state, x, y, divisor);
-                send_mouse_report(buttons, 0, x, y, 0, 0).await;
+                send_sourced_mouse_report(buttons, 0, x, y, 0, 0, source_meta).await;
             }
             QubePointingMode::Scroll => {
                 let invert_x = if self.settings.invert_scroll_x(source.side) {
@@ -1162,7 +1169,7 @@ impl<'a> QubePointingModeProcessor<'a> {
                 let divisor = self.settings.sens(source.side, QubePointingMode::Scroll);
                 let (h, v) =
                     qube_divided_motion(state, x.saturating_mul(invert_x), y.saturating_mul(invert_y), divisor);
-                send_mouse_report(buttons, 0, 0, 0, v, h).await;
+                send_sourced_mouse_report(buttons, 0, 0, 0, v, h, source_meta).await;
             }
             QubePointingMode::Text => {
                 let invert_x = if self.settings.invert_text_x(source.side) {
@@ -1396,6 +1403,33 @@ async fn send_mouse_report(source_buttons: u8, buttons: u8, x: i16, y: i16, whee
 
 async fn send_mouse_report_unchecked(buttons: u8, x: i16, y: i16, wheel: i16, pan: i16) {
     send_hid_mouse_report(buttons, x, y, wheel, pan).await;
+}
+
+#[cfg(feature = "rtt_diag")]
+type MouseSource = Option<crate::rtt_diag::MouseSourceMeta>;
+#[cfg(not(feature = "rtt_diag"))]
+type MouseSource = ();
+
+async fn send_sourced_mouse_report(
+    source_buttons: u8,
+    buttons: u8,
+    x: i16,
+    y: i16,
+    wheel: i16,
+    pan: i16,
+    source: MouseSource,
+) {
+    let buttons = source_buttons | buttons;
+    if buttons == 0 && x == 0 && y == 0 && wheel == 0 && pan == 0 {
+        return;
+    }
+    #[cfg(feature = "rtt_diag")]
+    send_hid_mouse_report_sourced(buttons, x, y, wheel, pan, source).await;
+    #[cfg(not(feature = "rtt_diag"))]
+    {
+        let _ = source;
+        send_hid_mouse_report(buttons, x, y, wheel, pan).await;
+    }
 }
 
 /// PointingProcessor that converts motion events to mouse reports

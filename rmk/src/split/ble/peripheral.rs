@@ -130,6 +130,19 @@ impl<'stack, 'server, 'c, P: PacketPool> SplitReader for BleSplitPeripheralDrive
 impl<'stack, 'server, 'c, P: PacketPool> SplitWriter for BleSplitPeripheralDriver<'stack, 'server, 'c, P> {
     async fn write(&mut self, message: &SplitMessage) -> Result<usize, SplitDriverError> {
         let mut buf = [0_u8; SPLIT_MESSAGE_MAX_SIZE];
+        #[cfg(feature = "rtt_diag")]
+        let sourced_message = match message {
+            SplitMessage::Pointing(event) => {
+                crate::rtt_diag::take_mouse_source_for_split(event).map(|meta| SplitMessage::PointingV2 {
+                    event: *event,
+                    seq: meta.seq,
+                    source_us: meta.timestamp_us,
+                })
+            }
+            _ => None,
+        };
+        #[cfg(feature = "rtt_diag")]
+        let message = sourced_message.as_ref().unwrap_or(message);
         let encoded = encode_split_message(message, &mut buf).map_err(|e| {
             error!("Postcard serialize split message error: {}", e);
             SplitDriverError::SerializeError

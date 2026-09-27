@@ -13,7 +13,9 @@ const _: () = assert!(SPLIT_REPORT_INTERVAL_US >= SPLIT_POINTING_CONN_INTERVAL_U
 /// The split peripheral can use the full PointingEvent i16 range so reducing
 /// its radio report rate does not discard or distort fast motion.
 pub(crate) fn take_report_axis(is_central: bool, accumulated: i32) -> i16 {
-    if cfg!(any(feature = "production_v22", feature = "pmw_axes_600_diag")) && !is_central {
+    if cfg!(feature = "mouse_realtime_b11")
+        || (cfg!(any(feature = "production_v22", feature = "pmw_axes_600_diag")) && !is_central)
+    {
         accumulated.clamp(i16::MIN as i32, i16::MAX as i32) as i16
     } else {
         accumulated.clamp(i8::MIN as i32, i8::MAX as i32) as i16
@@ -32,10 +34,22 @@ mod tests {
         assert_eq!(SPLIT_REPORT_INTERVAL_US, SPLIT_POINTING_CONN_INTERVAL_US * 2);
     }
 
+    #[cfg(not(feature = "mouse_realtime_b11"))]
     #[test]
     fn central_keeps_native_hid_sized_chunks() {
         assert_eq!(take_report_axis(true, 400), i8::MAX as i16);
         assert_eq!(take_report_axis(true, -400), i8::MIN as i16);
+    }
+
+    #[cfg(feature = "mouse_realtime_b11")]
+    #[test]
+    fn b11_local_and_split_producers_publish_i16_without_i8_source_tail() {
+        for is_central in [true, false] {
+            assert_eq!(take_report_axis(is_central, 32_000), 32_000);
+            assert_eq!(take_report_axis(is_central, -32_000), -32_000);
+            assert_eq!(take_report_axis(is_central, 40_000), i16::MAX);
+            assert_eq!(take_report_axis(is_central, -40_000), i16::MIN);
+        }
     }
 
     #[test]

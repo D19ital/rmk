@@ -171,6 +171,7 @@ mod steno_tests {
 
 /// A composite hid report which contains mouse, consumer, system reports.
 /// Report id is used to distinguish from them.
+#[cfg(not(feature = "mouse_usb_16bit_report"))]
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
         (collection = PHYSICAL, usage = POINTER) = {
@@ -213,7 +214,7 @@ mod steno_tests {
     }
 )]
 #[derive(Default, Serialize)]
-pub struct CompositeReport {
+pub struct CompositeReport8 {
     pub(crate) buttons: u8, // MouseButtons
     pub(crate) x: i8,
     pub(crate) y: i8,
@@ -221,6 +222,152 @@ pub struct CompositeReport {
     pub(crate) pan: i8,   // Scroll left (negative) or right (positive) this many units
     pub(crate) media_usage_id: u16,
     pub(crate) system_usage_id: u8,
+}
+
+#[cfg(feature = "mouse_usb_16bit_report")]
+#[gen_hid_descriptor(
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
+        (collection = PHYSICAL, usage = POINTER) = {
+            (report_id = 0x02,) = {
+                (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = BUTTON_8) = {
+                    #[packed_bits = 8] #[item_settings(data,variable,absolute)] buttons=input;
+                };
+                (usage_page = GENERIC_DESKTOP,) = {
+                    (usage = X,) = { #[item_settings(data,variable,relative)] x=input; };
+                    (usage = Y,) = { #[item_settings(data,variable,relative)] y=input; };
+                    (usage = WHEEL,) = { #[item_settings(data,variable,relative)] wheel=input; };
+                };
+                (usage_page = CONSUMER,) = {
+                    (usage = AC_PAN,) = { #[item_settings(data,variable,relative)] pan=input; };
+                };
+            };
+        };
+    },
+    (collection = APPLICATION, usage_page = CONSUMER, usage = CONSUMER_CONTROL) = {
+        (report_id = 0x03,) = {
+            (usage_page = CONSUMER, usage_min = 0x00, usage_max = 0x514) = {
+            #[item_settings(data,array,absolute,not_null)] media_usage_id=input;
+            }
+        };
+    },
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = SYSTEM_CONTROL) = {
+        (report_id = 0x04,) = {
+            (usage_min = 0x01, usage_max = 0xB7, logical_min = 1) = {
+                #[item_settings(data,array,absolute,not_null)] system_usage_id=input;
+            };
+        };
+    }
+)]
+#[derive(Default, Serialize)]
+pub struct CompositeReport16 {
+    pub(crate) buttons: u8,
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) wheel: i8,
+    pub(crate) pan: i8,
+    pub(crate) media_usage_id: u16,
+    pub(crate) system_usage_id: u8,
+}
+
+#[cfg(not(feature = "mouse_usb_16bit_report"))]
+pub type CompositeReport = CompositeReport8;
+#[cfg(feature = "mouse_usb_16bit_report")]
+pub type CompositeReport = CompositeReport16;
+
+/// USB Report ID 2 payload for the B11 profile. The report ID is prepended by
+/// the composite USB writer and is intentionally absent from this serializer.
+#[cfg(feature = "mouse_usb_16bit_report")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct UsbMouse16Report {
+    pub(crate) buttons: u8,
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) wheel: i8,
+    pub(crate) pan: i8,
+}
+
+#[cfg(feature = "mouse_usb_16bit_report")]
+impl From<MouseReport> for UsbMouse16Report {
+    fn from(report: MouseReport) -> Self {
+        Self {
+            buttons: report.buttons,
+            x: i16::from(report.x),
+            y: i16::from(report.y),
+            wheel: report.wheel,
+            pan: report.pan,
+        }
+    }
+}
+
+#[cfg(feature = "mouse_usb_16bit_report")]
+impl AsInputReport for UsbMouse16Report {
+    fn serialize(&self, buffer: &mut [u8]) -> Result<usize, usbd_hid::descriptor::BufferOverflow> {
+        if buffer.len() < 7 {
+            return Err(usbd_hid::descriptor::BufferOverflow);
+        }
+        buffer[0] = self.buttons;
+        buffer[1..3].copy_from_slice(&self.x.to_le_bytes());
+        buffer[3..5].copy_from_slice(&self.y.to_le_bytes());
+        buffer[5] = self.wheel as u8;
+        buffer[6] = self.pan as u8;
+        Ok(7)
+    }
+}
+
+#[cfg(all(test, feature = "mouse_usb_16bit_report"))]
+mod usb_mouse16_tests {
+    use super::{CompositeReport, UsbMouse16Report};
+    use usbd_hid::descriptor::{AsInputReport, SerializedDescriptor};
+
+    #[test]
+    fn b11_descriptor_declares_signed_i16_xy_and_i8_aux_axes() {
+        let desc = CompositeReport::desc();
+        assert!(desc.windows(2).any(|w| w == [0x85, 0x02]));
+        assert!(desc.windows(2).any(|w| w == [0x75, 0x10]));
+        assert!(desc.windows(5).any(|w| w == [0x17, 0x01, 0x80, 0xff, 0xff]));
+        assert!(desc.windows(3).any(|w| w == [0x26, 0xff, 0x7f]));
+        assert!(desc.windows(2).any(|w| w == [0x75, 0x08]));
+    }
+
+    #[test]
+    fn b11_mouse_payload_golden_bytes_match_descriptor_order() {
+        let report = UsbMouse16Report {
+            buttons: 0xa5,
+            x: 0x1234,
+            y: -0x1234,
+            wheel: -7,
+            pan: 9,
+        };
+        let mut bytes = [0u8; 7];
+        assert_eq!(report.serialize(&mut bytes).unwrap(), 7);
+        assert_eq!(bytes, [0xa5, 0x34, 0x12, 0xcc, 0xed, 0xf9, 0x09]);
+        let mut wire = [0u8; 8];
+        wire[0] = 2;
+        wire[1..].copy_from_slice(&bytes);
+        assert_eq!(wire, [0x02, 0xa5, 0x34, 0x12, 0xcc, 0xed, 0xf9, 0x09]);
+        assert!(report.serialize(&mut [0u8; 6]).is_err());
+    }
+
+    #[test]
+    fn ordinary_i8_mouse_report_widens_without_sign_change() {
+        let report = usbd_hid::descriptor::MouseReport {
+            buttons: 3,
+            x: -128,
+            y: 127,
+            wheel: -4,
+            pan: 5,
+        };
+        assert_eq!(
+            UsbMouse16Report::from(report),
+            UsbMouse16Report {
+                buttons: 3,
+                x: -128,
+                y: 127,
+                wheel: -4,
+                pan: 5
+            }
+        );
+    }
 }
 
 /// The BLE report map: everything in one HID service, distinguished by report id.
@@ -231,7 +378,7 @@ pub struct CompositeReport {
 /// payloads are still serialized from `KeyboardReport`, `MouseReport`, etc.,
 /// as HID-over-GATT carries the report id in the Report Reference descriptor
 /// instead of the payload.
-#[cfg(feature = "_ble")]
+#[cfg(all(feature = "_ble", not(feature = "mouse_ble_16bit_report")))]
 #[gen_hid_descriptor(
     (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = KEYBOARD) = {
         (report_id = 0x01,) = {
@@ -291,7 +438,7 @@ pub struct CompositeReport {
 )]
 #[allow(dead_code)]
 #[derive(Default)]
-pub struct BleCompositeReport {
+pub struct BleCompositeReport8 {
     pub(crate) modifier: u8,
     pub(crate) reserved: u8,
     pub(crate) leds: u8,
@@ -305,7 +452,122 @@ pub struct BleCompositeReport {
     pub(crate) system_usage_id: u8,
 }
 
-#[cfg(all(feature = "_ble", feature = "host"))]
+#[cfg(all(feature = "_ble", feature = "mouse_ble_16bit_report"))]
+#[gen_hid_descriptor(
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = KEYBOARD) = {
+        (report_id = 0x01,) = {
+            (usage_page = KEYBOARD, usage_min = 0xE0, usage_max = 0xE7) = {
+                #[packed_bits = 8] #[item_settings(data,variable,absolute)] modifier=input;
+            };
+            (logical_min = 0,) = {
+                #[item_settings(constant,variable,absolute)] reserved=input;
+            };
+            (usage_page = LEDS, usage_min = 0x01, usage_max = 0x05) = {
+                #[packed_bits = 5] #[item_settings(data,variable,absolute)] leds=output;
+            };
+            (usage_page = KEYBOARD, usage_min = 0x00, usage_max = 0xDD) = {
+                #[item_settings(data,array,absolute)] keycodes=input;
+            };
+        };
+    },
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = MOUSE) = {
+        (collection = PHYSICAL, usage = POINTER) = {
+            (report_id = 0x02,) = {
+                (usage_page = BUTTON, usage_min = BUTTON_1, usage_max = BUTTON_8) = {
+                    #[packed_bits = 8] #[item_settings(data,variable,absolute)] buttons=input;
+                };
+                (usage_page = GENERIC_DESKTOP,) = {
+                    (usage = X,) = {
+                        #[item_settings(data,variable,relative)] x=input;
+                    };
+                    (usage = Y,) = {
+                        #[item_settings(data,variable,relative)] y=input;
+                    };
+                    (usage = WHEEL,) = {
+                        #[item_settings(data,variable,relative)] wheel=input;
+                    };
+                };
+                (usage_page = CONSUMER,) = {
+                    (usage = AC_PAN,) = {
+                        #[item_settings(data,variable,relative)] pan=input;
+                    };
+                };
+            };
+        };
+    },
+    (collection = APPLICATION, usage_page = CONSUMER, usage = CONSUMER_CONTROL) = {
+        (report_id = 0x03,) = {
+            (usage_page = CONSUMER, usage_min = 0x00, usage_max = 0x514) = {
+            #[item_settings(data,array,absolute,not_null)] media_usage_id=input;
+            }
+        };
+    },
+    (collection = APPLICATION, usage_page = GENERIC_DESKTOP, usage = SYSTEM_CONTROL) = {
+        (report_id = 0x04,) = {
+            (usage_min = 0x01, usage_max = 0xB7, logical_min = 1) = {
+                #[item_settings(data,array,absolute,not_null)] system_usage_id=input;
+            };
+        };
+    }
+)]
+#[allow(dead_code)]
+#[derive(Default)]
+pub struct BleCompositeReport16 {
+    pub(crate) modifier: u8,
+    pub(crate) reserved: u8,
+    pub(crate) leds: u8,
+    pub(crate) keycodes: [u8; 6],
+    pub(crate) buttons: u8,
+    pub(crate) x: i16,
+    pub(crate) y: i16,
+    pub(crate) wheel: i8,
+    pub(crate) pan: i8,
+    pub(crate) media_usage_id: u16,
+    pub(crate) system_usage_id: u8,
+}
+
+#[cfg(all(feature = "_ble", not(feature = "mouse_ble_16bit_report")))]
+pub type BleCompositeReport = BleCompositeReport8;
+#[cfg(all(feature = "_ble", feature = "mouse_ble_16bit_report"))]
+pub type BleCompositeReport = BleCompositeReport16;
+
+/// BLE-only seven-byte mouse payload used by the B8 production report map.
+/// HID-over-GATT carries report id 2 in the Report Reference descriptor, so
+/// the characteristic value contains only buttons, signed little-endian X/Y,
+/// wheel and pan.
+#[cfg(feature = "mouse_ble_16bit_report")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BleMouse16Report {
+    pub buttons: u8,
+    pub x: i16,
+    pub y: i16,
+    pub wheel: i8,
+    pub pan: i8,
+}
+
+#[cfg(feature = "mouse_ble_16bit_report")]
+impl AsInputReport for BleMouse16Report {
+    fn serialize(&self, buffer: &mut [u8]) -> Result<usize, usbd_hid::descriptor::BufferOverflow> {
+        if buffer.len() < 7 {
+            return Err(usbd_hid::descriptor::BufferOverflow);
+        }
+        buffer[0] = self.buttons;
+        buffer[1..3].copy_from_slice(&self.x.to_le_bytes());
+        buffer[3..5].copy_from_slice(&self.y.to_le_bytes());
+        buffer[5] = self.wheel as u8;
+        buffer[6] = self.pan as u8;
+        Ok(7)
+    }
+}
+
+#[cfg(all(feature = "_ble", feature = "mouse_ble_16bit_report"))]
+pub(crate) const BLE_COMPOSITE_REPORT_MAP_LEN: usize = 188;
+#[cfg(all(feature = "_ble", not(feature = "mouse_ble_16bit_report")))]
+pub(crate) const BLE_COMPOSITE_REPORT_MAP_LEN: usize = 178;
+
+#[cfg(all(feature = "_ble", feature = "host", feature = "mouse_ble_16bit_report"))]
+pub(crate) const BLE_REPORT_MAP_LEN: usize = 217;
+#[cfg(all(feature = "_ble", feature = "host", not(feature = "mouse_ble_16bit_report")))]
 pub(crate) const BLE_REPORT_MAP_LEN: usize = 207;
 
 /// Compose the one HID-over-GATT report map used by BLE hosts.
@@ -343,7 +605,11 @@ mod ble_report_map_tests {
         fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
             haystack.windows(needle.len()).position(|w| w == needle)
         }
-        assert_eq!(desc.len(), 178, "update HidService's report_map size on change");
+        assert_eq!(
+            desc.len(),
+            super::BLE_COMPOSITE_REPORT_MAP_LEN,
+            "update HidService's report_map size on change"
+        );
         let keyboard = find(desc, &[0x09, 0x06]).expect("missing Usage Keyboard");
         for report_id in 1u8..=4 {
             let id = find(desc, &[0x85, report_id]).unwrap_or_else(|| panic!("missing ReportID {report_id}"));
@@ -351,6 +617,43 @@ mod ble_report_map_tests {
                 assert!(keyboard < id, "keyboard collection must own ReportID 1");
             }
         }
+    }
+
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    #[test]
+    fn realtime_b8_descriptor_and_payload_are_exact() {
+        use super::BleMouse16Report;
+        use usbd_hid::descriptor::AsInputReport;
+
+        let desc = BleCompositeReport::desc();
+        assert_eq!(desc.len(), 188);
+        assert!(desc.windows(2).any(|w| w == [0x75, 0x10]), "missing 16-bit ReportSize");
+        assert!(
+            desc.windows(3).any(|w| w == [0x26, 0xff, 0x7f]),
+            "missing +32767 logical max"
+        );
+
+        let report = BleMouse16Report {
+            buttons: 0xa5,
+            x: 0x1234,
+            y: -0x1234,
+            wheel: -7,
+            pan: 9,
+        };
+        let mut bytes = [0u8; 7];
+        assert_eq!(report.serialize(&mut bytes).unwrap(), 7);
+        assert_eq!(bytes, [0xa5, 0x34, 0x12, 0xcc, 0xed, 0xf9, 0x09]);
+
+        let limits = BleMouse16Report {
+            buttons: 0xff,
+            x: -32767,
+            y: 32767,
+            wheel: -128,
+            pan: 127,
+        };
+        assert_eq!(limits.serialize(&mut bytes).unwrap(), 7);
+        assert_eq!(bytes, [0xff, 0x01, 0x80, 0xff, 0x7f, 0x80, 0x7f]);
+        assert!(limits.serialize(&mut [0u8; 6]).is_err());
     }
 
     #[cfg(feature = "host")]
@@ -420,6 +723,16 @@ pub trait HidWriterTrait {
 
     /// Write report to the host, return the number of bytes written if success.
     fn write_report(&mut self, report: &Self::ReportType) -> impl Future<Output = Result<usize, HidError>>;
+
+    /// Write the B8 BLE-private 16-bit mouse payload. USB writers retain the
+    /// default rejection and therefore keep their descriptor and wire ABI.
+    #[cfg(feature = "mouse_ble_16bit_report")]
+    fn write_ble_mouse16_report(
+        &mut self,
+        _report: &BleMouse16Report,
+    ) -> impl Future<Output = Result<usize, HidError>> {
+        async { Err(HidError::ReportSerializeError) }
+    }
 }
 
 /// HidReader trait is used for listening to HID messages from the host, via USB, BLE, etc.

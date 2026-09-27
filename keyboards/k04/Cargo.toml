@@ -19,11 +19,17 @@ usb_debug_force_ble = ["usb_debug"]
 rtt_diag = ["rmk/rtt_diag"]
 mouse_interval_control = ["rmk/mouse_interval_control"]
 mouse_vector_preserve = ["mouse_interval_control", "rmk/mouse_vector_preserve"]
+mouse_realtime_reversal_budget_3 = ["mouse_vector_preserve", "rmk/mouse_realtime_reversal_budget_3"]
+mouse_realtime_b8 = ["mouse_realtime_reversal_budget_3", "fixed_mouse_pacing_15ms", "rmk/mouse_ble_16bit_report"]
+mouse_realtime_b8_diag = ["mouse_realtime_b8", "rtt_diag"]
+mouse_realtime_b11 = ["mouse_realtime_b8", "mouse_usb_16bit_report"]
+mouse_usb_16bit_report = ["rmk/mouse_usb_16bit_report"]
 fixed_mouse_pacing_15ms = ["mouse_vector_preserve", "rmk/fixed_mouse_pacing_15ms"]
 host_fixed_15ms = ["rtt_diag", "rmk/host_fixed_15ms"]
 pmw_axes_600 = []
 production_v22 = ["mouse_vector_preserve", "pmw_axes_600", "right_uf2_cleanup"]
-production_v30g = ["production_v22", "fixed_mouse_pacing_15ms", "rmk/host_first_split_wake"]
+production_v30g = ["production_v22", "mouse_realtime_b11", "rmk/host_first_split_wake"]
+production_v30g_rtt_diag = ["production_v30g", "rtt_diag"]
 pmw_force_awake_diag = ["mouse_interval_control", "rtt_diag"]
 pmw_smart_off_diag = ["mouse_interval_control", "rtt_diag"]
 pmw_raw_600_diag = ["mouse_interval_control", "rtt_diag"]
@@ -158,6 +164,13 @@ opt-level = "z"
 overflow-checks = false
 lto = "fat"
 strip = "symbols"
+
+# defmt decoders discover the wire-format version through the exported
+# `_defmt_version_ = 4` ELF symbol. Keep symbols in diagnostic artifacts while
+# retaining the release code-generation settings and production profile.
+[profile.defmt-release]
+inherits = "release"
+strip = "debuginfo"
 
 # Prevent cargo from looking for a workspace above this directory
 [workspace]
