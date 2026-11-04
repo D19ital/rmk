@@ -3480,6 +3480,65 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "velvet_full_pointing")]
+    #[test]
+    fn velvet_wide_hid_writer_drains_without_sensor_rate_pacing_and_orders_buttons() {
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+
+        #[derive(Default)]
+        struct RecordingWriter(Vec<Report>);
+        impl crate::hid::HidWriterTrait for RecordingWriter {
+            type ReportType = Report;
+            async fn write_report(&mut self, report: &Report) -> Result<usize, crate::hid::HidError> {
+                self.0.push(report.clone());
+                Ok(5)
+            }
+        }
+
+        // Velvet does not opt into any K:04 pacing/radio feature.
+        assert!(!cfg!(feature = "mouse_interval_control"));
+        for (x, y) in [(300, 90), (300, -90), (-300, 90), (-300, -90)] {
+            BLE_REPORT_CHANNEL.clear();
+            BLE_REPORT_CHANNEL
+                .try_send(QueuedReport::new_wide_mouse(3, x, y, 0, 0))
+                .unwrap();
+            BLE_REPORT_CHANNEL
+                .try_send(QueuedReport::new_wide_mouse(0, 0, 0, 0, 0))
+                .unwrap();
+            BLE_REPORT_CHANNEL
+                .try_send(QueuedReport::new(Report::KeyboardReport(KeyboardReport::default())))
+                .unwrap();
+            let mut writer = RecordingWriter::default();
+            let start = Instant::now();
+            {
+                let mut task = core::pin::pin!(run_ble_hid_writer(&mut writer, true));
+                let mut cx = Context::from_waker(Waker::noop());
+                // A ready host drains all chunks in this poll, then waits for
+                // the next source event. No 8 ms residual timer is involved.
+                assert!(matches!(task.as_mut().poll(&mut cx), Poll::Pending));
+            }
+            assert_eq!(Instant::now(), start);
+            assert_eq!(writer.0.len(), 5);
+            let mut sum = (0i32, 0i32);
+            for report in &writer.0[..3] {
+                let Report::MouseReport(report) = report else {
+                    panic!("motion order changed");
+                };
+                assert_eq!(report.buttons, 3);
+                assert_eq!((i16::from(report.x), i16::from(report.y)), (x / 3, y / 3));
+                sum.0 += i32::from(report.x);
+                sum.1 += i32::from(report.y);
+            }
+            assert_eq!(sum, (i32::from(x), i32::from(y)));
+            assert!(
+                matches!(&writer.0[3], Report::MouseReport(report) if report.buttons == 0 && report.x == 0 && report.y == 0)
+            );
+            assert!(matches!(&writer.0[4], Report::KeyboardReport(_)));
+            assert!(BLE_REPORT_CHANNEL.is_empty());
+        }
+    }
+
     #[test]
     fn one_extreme_wide_queue_item_preserves_the_complete_delta() {
         let mut accumulated = super::AccumulatedMouseReport::new_wide(

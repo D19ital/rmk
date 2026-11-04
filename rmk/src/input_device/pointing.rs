@@ -14,11 +14,13 @@ use usbd_hid::descriptor::MouseReport;
 
 use crate::channel::{send_hid_mouse_report, send_hid_report};
 use crate::core_traits::Runnable;
+#[cfg(any(not(feature = "velvet_full_pointing"), test))]
+use crate::event::publish_event;
 #[cfg(feature = "split")]
 use crate::event::{ActionEvent, KeyboardEvent, LayerChangeEvent, PeripheralSettingsEvent};
 use crate::event::{
     Axis, AxisEvent, AxisValType, EventSubscriber, PointingEvent, PointingProcessorEvent, PointingSetCpiEvent,
-    PointingTransformEvent, SubscribableEvent, publish_event,
+    PointingTransformEvent, SubscribableEvent,
 };
 use crate::hid::{KeyboardReport, Report};
 use crate::keymap::KeyMap;
@@ -92,11 +94,9 @@ pub struct PointingDevice<S: PointingDriver> {
     pub accumulated_y: i32,
 }
 
-// Pointing motion is real-time state, not a lossless command stream. Using the
-// generic input-device backpressure path lets a temporarily busy BLE split
-// sender build a FIFO of stale 125 Hz samples. K:04 deliberately publishes its
-// PMW3610 motion immediately for the same reason: keep the newest motion and
-// let lagging subscribers skip obsolete samples.
+// Default targets publish motion immediately to avoid a stale split FIFO.
+// The opt-in Velvet standalone path below instead preserves relative events:
+// its sensor is local to the host central, not behind a split BLE sender.
 impl<S: PointingDriver> Runnable for PointingDevice<S> {
     async fn run(&mut self) -> ! {
         use embassy_futures::select::{Either, select};
@@ -104,7 +104,14 @@ impl<S: PointingDriver> Runnable for PointingDevice<S> {
         let mut cpi_sub = PointingSetCpiEvent::subscriber();
         loop {
             match select(self.read_pointing_event(), cpi_sub.next_event()).await {
-                Either::First(event) => publish_event(event),
+                Either::First(event) => {
+                    // Relative deltas are not replaceable state. Velvet's
+                    // local path must retain every event under backpressure.
+                    #[cfg(feature = "velvet_full_pointing")]
+                    crate::event::publish_event_async(event).await;
+                    #[cfg(not(feature = "velvet_full_pointing"))]
+                    publish_event(event);
+                }
                 Either::Second(event) => self.on_pointing_set_cpi_event(event).await,
             }
         }
@@ -179,11 +186,16 @@ impl<S: PointingDriver> PointingDevice<S> {
             return None;
         }
 
-        // A HID mouse report can carry only i8 motion. Emit one transport-safe
-        // chunk and preserve the residual for subsequent 125 Hz reports; zeroing
-        // the full accumulator here silently discarded fast PMW3610 movement.
-        let dx = self.accumulated_x.clamp(i8::MIN as i32, i8::MAX as i32) as i16;
-        let dy = self.accumulated_y.clamp(i8::MIN as i32, i8::MAX as i32) as i16;
+        // Velvet's local event is i16, not a serialized HID frame. Keeping an
+        // i8-sized residual here caps travel at 127/-128 counts per 8 ms and
+        // replays fast motion long after the ball stops. The transport already
+        // supports wide queue items and owns the final i8 chunking.
+        #[cfg(feature = "velvet_full_pointing")]
+        let (min, max) = (i16::MIN as i32, i16::MAX as i32);
+        #[cfg(not(feature = "velvet_full_pointing"))]
+        let (min, max) = (i8::MIN as i32, i8::MAX as i32);
+        let dx = self.accumulated_x.clamp(min, max) as i16;
+        let dy = self.accumulated_y.clamp(min, max) as i16;
 
         self.accumulated_x -= i32::from(dx);
         self.accumulated_y -= i32::from(dy);
@@ -1574,15 +1586,29 @@ impl<'a> PointingProcessor<'a> {
             }
         }
 
+        // The full-width Velvet path can now reach i16::MIN. Negation at
+        // that boundary must saturate rather than wrap or panic. Flag-off
+        // targets retain their previous arithmetic.
+        let negate = |value: i16| {
+            #[cfg(feature = "velvet_full_pointing")]
+            {
+                value.saturating_neg()
+            }
+            #[cfg(not(feature = "velvet_full_pointing"))]
+            {
+                -value
+            }
+        };
+
         // Apply global config transforms (before mode-specific processing).
         // Order: invert → swap → mode invert.
         // Mode-specific invert_x/y operate on the post-swap logical axes,
         // so if swap_xy is enabled, ScrollConfig::invert_y affects the physical X axis.
         if self.config.invert_x {
-            x = -x;
+            x = negate(x);
         }
         if self.config.invert_y {
-            y = -y;
+            y = negate(y);
         }
         if self.config.swap_xy {
             (x, y) = (y, x);
@@ -1594,19 +1620,13 @@ impl<'a> PointingProcessor<'a> {
             PointingMode::Disabled => {}
             PointingMode::Cursor(_) | PointingMode::Scroll(_) | PointingMode::Sniper(_) => {
                 // modes that generate mouse reports
-                let mouse_report = match self.current_mode {
+                let (out_x, out_y, wheel, pan) = match self.current_mode {
                     PointingMode::Cursor(cursor_config) => {
                         let out_x = x.saturating_mul(cursor_config.multiplier_x as i16);
                         let out_y = y.saturating_mul(cursor_config.multiplier_y as i16);
-                        let out_x = if cursor_config.invert_x { -out_x } else { out_x };
-                        let out_y = if cursor_config.invert_y { -out_y } else { out_y };
-                        MouseReport {
-                            buttons,
-                            x: out_x.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                            y: out_y.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                            wheel: 0,
-                            pan: 0,
-                        }
+                        let out_x = if cursor_config.invert_x { negate(out_x) } else { out_x };
+                        let out_y = if cursor_config.invert_y { negate(out_y) } else { out_y };
+                        (out_x, out_y, 0, 0)
                     }
                     PointingMode::Scroll(scroll_config) => {
                         let (sx, sy) = self.accumulator.accumulate(
@@ -1621,15 +1641,9 @@ impl<'a> PointingProcessor<'a> {
                         // Sensor X → pan, sensor Y → wheel.
                         // Default: sensor +Y produces negative wheel (scroll up in HID convention).
                         // invert_y reverses wheel direction; invert_x reverses pan direction.
-                        let wheel = if scroll_config.invert_y { sy } else { -sy };
-                        let pan = if scroll_config.invert_x { -sx } else { sx };
-                        MouseReport {
-                            buttons,
-                            x: 0,
-                            y: 0,
-                            wheel: wheel.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                            pan: pan.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                        }
+                        let wheel = if scroll_config.invert_y { sy } else { negate(sy) };
+                        let pan = if scroll_config.invert_x { negate(sx) } else { sx };
+                        (0, 0, wheel, pan)
                     }
                     PointingMode::Sniper(sniper_config) => {
                         let (sx, sy) = self.accumulator.accumulate(
@@ -1641,20 +1655,24 @@ impl<'a> PointingProcessor<'a> {
                         if sx == 0 && sy == 0 {
                             return;
                         }
-                        let out_x = if sniper_config.invert_x { -sx } else { sx };
-                        let out_y = if sniper_config.invert_y { -sy } else { sy };
-                        MouseReport {
-                            buttons,
-                            x: out_x.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                            y: out_y.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
-                            wheel: 0,
-                            pan: 0,
-                        }
+                        let out_x = if sniper_config.invert_x { negate(sx) } else { sx };
+                        let out_y = if sniper_config.invert_y { negate(sy) } else { sy };
+                        (out_x, out_y, 0, 0)
                     }
                     _ => unreachable!(),
                 };
 
-                send_hid_report(Report::MouseReport(mouse_report)).await;
+                #[cfg(feature = "velvet_full_pointing")]
+                send_hid_mouse_report(buttons, out_x, out_y, wheel, pan).await;
+                #[cfg(not(feature = "velvet_full_pointing"))]
+                send_hid_report(Report::MouseReport(MouseReport {
+                    buttons,
+                    x: out_x.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
+                    y: out_y.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
+                    wheel: wheel.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
+                    pan: pan.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
+                }))
+                .await;
             }
             PointingMode::Caret(caret_config) => {
                 if let Some((keycode, count)) = compute_caret_taps(x, y, &mut self.accumulator, &caret_config) {
@@ -1730,7 +1748,18 @@ fn compute_caret_taps(
     let divisor_y = if cfg.disable_y { 0 } else { 1 };
     let (mut dx, mut dy) = accumulator.accumulate_persistent(x, y, (1, divisor_x), (1, divisor_y));
 
-    if (dx.abs() + dy.abs()) <= cfg.threshold {
+    // Native Velvet deltas can reach i16::MIN and a 65536 diagonal sum.
+    // Widen before abs/summing; retain legacy arithmetic for every flag-off target.
+    #[cfg(feature = "velvet_full_pointing")]
+    let magnitude = |value: i16| i32::from(value).abs();
+    #[cfg(not(feature = "velvet_full_pointing"))]
+    let magnitude = |value: i16| value.abs();
+    #[cfg(feature = "velvet_full_pointing")]
+    let threshold = i32::from(cfg.threshold);
+    #[cfg(not(feature = "velvet_full_pointing"))]
+    let threshold = cfg.threshold;
+
+    if (magnitude(dx) + magnitude(dy)) <= threshold {
         return None;
     }
 
@@ -1738,7 +1767,7 @@ fn compute_caret_taps(
         X,
         Y,
     }
-    let axis = if dx.abs() >= dy.abs() {
+    let axis = if magnitude(dx) >= magnitude(dy) {
         MovementAxis::X
     } else {
         MovementAxis::Y
@@ -1759,7 +1788,7 @@ fn compute_caret_taps(
     // Each tap reduces the running total on the dominant axis by `threshold`.
     // The number of iterations is the tap count.
     let mut count: u8 = 0;
-    while (dx.abs() + dy.abs()) > cfg.threshold {
+    while (magnitude(dx) + magnitude(dy)) > threshold {
         let (reduce_x, reduce_y) = match axis {
             MovementAxis::X => {
                 let r = if dx > 0 { -cfg.threshold } else { cfg.threshold };
@@ -1787,6 +1816,11 @@ fn compute_caret_taps(
 
     if count == 0 { None } else { Some((keycode, count)) }
 }
+
+#[cfg(all(test, feature = "velvet_full_pointing", feature = "split"))]
+#[allow(dead_code)]
+#[path = "../../../keyboards/common/velvet_pointing.rs"]
+mod velvet_settings_test_source;
 
 #[cfg(test)]
 mod tests {
@@ -3791,6 +3825,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "velvet_full_pointing"))]
     #[test]
     fn report_preserves_motion_that_does_not_fit_one_hid_frame() {
         let driver = DummyDriver {
@@ -3825,6 +3860,11 @@ mod tests {
         assert_eq!(device.accumulated_x, 46);
         assert_eq!(device.accumulated_y, -44);
     }
+
+    // Full-width local Velvet regression; included here to exercise the real
+    // private sensor/processor methods with the existing dummy hardware driver.
+    #[cfg(feature = "velvet_full_pointing")]
+    include!("velvet_motion_tests.rs");
 
     // === MotionAccumulator tests ===
 

@@ -124,6 +124,9 @@ mouse_vector_preserve = ["mouse_interval_control"]
 ## Keep vector-preserving mouse HID traffic at one report per 15 ms slot.
 fixed_mouse_pacing_15ms = ["mouse_vector_preserve"]
 
+## Velvet standalone TEST1: keep local sensor events full-width until HID serialization.
+velvet_full_pointing = []
+
 ## K:04 Standalone-only auto-layer timeout presets; Qube keeps its v9 table.
 k04_standalone_timeout_14 = []
 
